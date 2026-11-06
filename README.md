@@ -1,2 +1,1 @@
-# Vision-X-
-vision x a premium mod
+Doesn't matter if Click Between Frames is on.
