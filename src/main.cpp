@@ -1,259 +1,522 @@
 #include <Geode/Geode.hpp>
-#include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
+#include <Geode/UI.hpp>
+#include <Geode/loader/GameEvent.hpp>
+#include <Geode/loader/SettingV3.hpp>
+
 #include <algorithm>
 #include <array>
-#include <chrono>
+#include <functional>
 #include <string>
+#include <vector>
 
 using namespace geode::prelude;
 
-// VISION X source foundation: bounded input-buffer settings + in-level control panel.
-// Maximum supported tuning is deliberately capped at 60 ticks.
 namespace vx {
-    constexpr int MAX_BUFFER_TICKS = 60;
-    constexpr int MAX_CLICK_TICKS = 30;
+    constexpr int MAX_TICK_TUNING = 80;
+    constexpr int MAX_CLICK_TUNING = 30;
+    constexpr int MAX_RELEASE_TUNING = 60;
 
     enum class Tab { Log, Stages, Modes, Tools };
+    enum class TuningPage { Tick, ClickRelease };
+
+    struct ModeTuning {
+        int minTicks = 2;
+        int maxTicks = 8;
+        int clickTicks = 0;
+        int releaseTicks = 0;
+    };
 
     struct Settings {
         bool enabled = true;
         int stage = 1;
-        int minTicks = 2;
-        int maxTicks = 2;
-        int clickMin = 0;
-        int clickMax = 0;
-        int releaseMin = 0;
-        int releaseMax = 0;
-        int mode = 0;
+        int selectedMode = 0;
+        std::array<ModeTuning, 8> modes{};
     };
 
     static Settings g_settings;
-    static PlayLayer* g_layer = nullptr;
-    static CCNode* g_panel = nullptr;
-    static CCNode* g_content = nullptr;
-    static CCLabelBMFont* g_status = nullptr;
-    static Tab g_tab = Tab::Stages;
-    static std::chrono::steady_clock::time_point g_lastLog{};
-    static int g_lastLogCode = -1;
+    class VisionXOverlay;
+    static VisionXOverlay* g_overlay = nullptr;
 
-    static void logThrottled(int code, std::string const& message) {
-        auto now = std::chrono::steady_clock::now();
-        if (code == g_lastLogCode &&
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastLog).count() < 250)
+    constexpr std::array<const char*, 8> MODE_NAMES = {
+        "CUBE", "SHIP", "BALL", "UFO", "WAVE", "ROBOT", "SPIDER", "SWING"
+    };
+    constexpr std::array<const char*, 8> MODE_MARKS = {
+        "C", "S", "B", "U", "W", "R", "SP", "SW"
+    };
+    constexpr std::array<const char*, 6> STAGE_NAMES = {
+        "OFF", "1", "2", "3", "EXTREME", "CUSTOM"
+    };
+
+    // Release controls are unavailable for Cube, Ball, UFO, Spider and Swing.
+    static bool hasReleaseTuning(int mode) {
+        return mode == 1 || mode == 4 || mode == 5;
+    }
+
+    static std::string stageName() {
+        return STAGE_NAMES[std::clamp(g_settings.stage, 0, 5)];
+    }
+
+    static void applyStage(int stage) {
+        g_settings.stage = std::clamp(stage, 0, 5);
+        if (stage == 0) {
+            g_settings.enabled = false;
             return;
-        g_lastLog = now;
-        g_lastLogCode = code;
-        log::info("[VISION X] {}", message);
+        }
+        g_settings.enabled = true;
+        if (stage == 5) return; // Custom leaves the current per-mode values intact.
+
+        int minTicks = 2;
+        int maxTicks = 8;
+        switch (stage) {
+            case 2: minTicks = 4;  maxTicks = 16; break;
+            case 3: minTicks = 8;  maxTicks = 32; break;
+            case 4: minTicks = 16; maxTicks = 80; break;
+            default: break;
+        }
+        for (auto& mode : g_settings.modes) {
+            mode.minTicks = minTicks;
+            mode.maxTicks = maxTicks;
+        }
     }
 
-    static void setStatus(std::string const& s) {
-        if (g_status) g_status->setString(s.c_str());
+    static void resetTuning() {
+        for (auto& mode : g_settings.modes) mode = ModeTuning{};
+        g_settings.enabled = true;
+        g_settings.stage = 1;
+        g_settings.selectedMode = 0;
     }
 
-    static CCMenuItemSpriteExtra* makeButton(
-        std::string const& title, SEL_MenuHandler callback, CCNode* target,
-        float scale = 0.55f
-    ) {
-        auto sprite = ButtonSprite::create(title.c_str(), 90, true, "goldFont.fnt", "GJ_button_01.png", 25.f, scale);
-        return CCMenuItemSpriteExtra::create(sprite, target, callback);
-    }
+    class VisionXOverlay final : public CCLayer {
+        struct ButtonHitbox {
+            CCRect rect;
+            CCNode* visual = nullptr;
+            std::function<void()> callback;
+        };
 
-    class Panel : public CCLayer {
+        static constexpr float PANEL_W = 640.f;
+        static constexpr float PANEL_H = 440.f;
+
+        CCLayerColor* m_shade = nullptr;
+        CCNode* m_panel = nullptr;
+        CCNode* m_content = nullptr;
+        float m_panelScale = 1.f;
+        Tab m_tab = Tab::Stages;
+        TuningPage m_tuningPage = TuningPage::Tick;
+        bool m_showTuning = false;
+        bool m_closing = false;
+        int m_pressedButton = -1;
+        std::vector<ButtonHitbox> m_buttons;
+
+        const ccColor3B pink = {255, 132, 198};
+        const ccColor3B palePink = {255, 190, 222};
+        const ccColor3B textColor = {235, 231, 242};
+        const ccColor3B muted = {150, 145, 166};
+        const ccColor3B dark = {22, 19, 32};
+        const ccColor3B cardColor = {34, 29, 47};
+        const ccColor3B cardLight = {45, 37, 59};
+
     public:
-        static Panel* create() {
-            auto ret = new Panel();
-            if (ret->init()) { ret->autorelease(); return ret; }
+        static VisionXOverlay* create() {
+            auto ret = new VisionXOverlay();
+            if (ret->init()) {
+                ret->autorelease();
+                return ret;
+            }
             delete ret;
             return nullptr;
         }
 
         bool init() override {
             if (!CCLayer::init()) return false;
-            auto win = CCDirector::sharedDirector()->getWinSize();
+            const auto win = CCDirector::sharedDirector()->getWinSize();
+            setContentSize(win);
+            setTouchEnabled(true);
+            setTouchMode(kCCTouchesOneByOne);
 
-            auto shade = CCLayerColor::create({12, 8, 24, 225});
-            shade->setContentSize({330.f, 250.f});
-            shade->setPosition({win.width - 348.f, win.height - 270.f});
-            shade->setID("visionx-panel-bg");
-            addChild(shade);
+            m_shade = CCLayerColor::create({5, 4, 12, 0}, win.width, win.height);
+            if (!m_shade) return false;
+            addChild(m_shade, 0);
 
-            auto title = CCLabelBMFont::create("VISION X", "bigFont.fnt");
-            title->setScale(0.55f);
-            title->setColor({255, 150, 220});
-            title->setAnchorPoint({0.f, 0.5f});
-            title->setPosition({win.width - 338.f, win.height - 35.f});
-            addChild(title);
+            m_panel = CCNode::create();
+            m_panel->setContentSize({PANEL_W, PANEL_H});
+            m_panel->setAnchorPoint({0.5f, 0.5f});
+            m_panel->setPosition({win.width / 2.f, win.height / 2.f});
+            m_panel->setCascadeOpacityEnabled(true);
+            const float fit = std::min((win.width - 28.f) / PANEL_W, (win.height - 28.f) / PANEL_H);
+            m_panelScale = std::clamp(fit, 0.55f, 1.f);
+            m_panel->setScale(m_panelScale * 0.90f);
+            addChild(m_panel, 10);
 
-            auto close = CCMenu::create();
-            close->setPosition({win.width - 35.f, win.height - 35.f});
-            auto x = CCMenuItemLabel::create(CCLabelBMFont::create("X", "bigFont.fnt"), this, menu_selector(Panel::onClose));
-            close->addChild(x);
-            addChild(close);
+            buildPanelChrome();
+            m_content = CCNode::create();
+            m_content->setContentSize({PANEL_W, PANEL_H});
+            m_content->setAnchorPoint({0.5f, 0.5f});
+            m_content->setPosition({PANEL_W / 2.f, PANEL_H / 2.f});
+            m_panel->addChild(m_content, 5);
+            redraw();
 
-            auto tabs = CCMenu::create();
-            tabs->setPosition({win.width - 183.f, win.height - 62.f});
-            const char* names[] = {"Log", "Stages", "Modes", "Tools"};
-            for (int i = 0; i < 4; ++i) {
-                auto item = CCMenuItemLabel::create(CCLabelBMFont::create(names[i], "bigFont.fnt"), this,
-                    i == 0 ? menu_selector(Panel::onLog) :
-                    i == 1 ? menu_selector(Panel::onStages) :
-                    i == 2 ? menu_selector(Panel::onModes) : menu_selector(Panel::onTools));
-                item->setScale(0.38f);
-                item->setPosition({-105.f + i * 70.f, 0.f});
-                tabs->addChild(item);
-            }
-            addChild(tabs);
-
-            g_content = CCNode::create();
-            g_content->setPosition({win.width - 338.f, win.height - 88.f});
-            addChild(g_content);
-            drawTab();
+            m_shade->runAction(CCFadeTo::create(0.18f, 176));
+            m_panel->runAction(CCEaseBackOut::create(CCScaleTo::create(0.24f, m_panelScale)));
             return true;
         }
 
-        void onClose(CCObject*) { removeFromParentAndCleanup(true); g_panel = nullptr; }
+        void registerWithTouchDispatcher() override {
+            // High-priority, swallowing delegate: touches never fall through to GD UI.
+            CCTouchDispatcher::get()->addTargetedDelegate(this, -500, true);
+        }
 
-        void onLog(CCObject*) { g_tab = Tab::Log; drawTab(); }
-        void onStages(CCObject*) { g_tab = Tab::Stages; drawTab(); }
-        void onModes(CCObject*) { g_tab = Tab::Modes; drawTab(); }
-        void onTools(CCObject*) { g_tab = Tab::Tools; drawTab(); }
-
-        void drawTab() {
-            if (!g_content) return;
-            g_content->removeAllChildrenWithCleanup(true);
-            auto addLine = [&](std::string const& text, float y, ccColor3B color = {235, 225, 245}) {
-                auto label = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
-                label->setAnchorPoint({0.f, 0.5f});
-                label->setScale(0.38f);
-                label->setColor(color);
-                label->setPosition({0.f, y});
-                g_content->addChild(label);
-            };
-            auto addAction = [&](std::string const& text, float x, float y, SEL_MenuHandler cb) {
-                auto menu = CCMenu::create();
-                menu->setPosition({x, y});
-                auto item = makeButton(text, cb, this, 0.42f);
-                menu->addChild(item);
-                g_content->addChild(menu);
-            };
-
-            if (g_tab == Tab::Stages) {
-                addLine("STAGE SELECT", 0.f, {255, 150, 220});
-                const char* stages[] = {"Off", "1", "2", "3", "Extreme", "Custom"};
-                for (int i = 0; i < 6; ++i) {
-                    auto menu = CCMenu::create();
-                    menu->setPosition({24.f + (i % 3) * 94.f, -28.f - (i / 3) * 31.f});
-                    auto item = makeButton(stages[i], this->stageCallbacks()[i], this, 0.36f);
-                    menu->addChild(item);
-                    g_content->addChild(menu);
+        bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
+            m_pressedButton = -1;
+            const auto point = m_panel->convertToNodeSpace(touch->getLocation());
+            for (int i = static_cast<int>(m_buttons.size()) - 1; i >= 0; --i) {
+                if (m_buttons[i].rect.containsPoint(point)) {
+                    m_pressedButton = i;
+                    if (m_buttons[i].visual) m_buttons[i].visual->setScale(0.96f);
+                    break;
                 }
-                addLine("TICK TUNING  |  MAX 60", -100.f, {255, 150, 220});
-                addLine(fmt::format("Minimum: {} ticks", g_settings.minTicks), -126.f);
-                addLine(fmt::format("Maximum: {} ticks", g_settings.maxTicks), -150.f);
-                addAction("MIN -", 45.f, -177.f, menu_selector(Panel::minDown));
-                addAction("MIN +", 115.f, -177.f, menu_selector(Panel::minUp));
-                addAction("MAX -", 205.f, -177.f, menu_selector(Panel::maxDown));
-                addAction("MAX +", 275.f, -177.f, menu_selector(Panel::maxUp));
-                addLine("Click tuning: 0-30 | Release tuning: 0-60", -211.f);
-            } else if (g_tab == Tab::Log) {
-                addLine("LIVE LOG", 0.f, {255, 150, 220});
-                addLine(g_settings.enabled ? "Buffer active" : "Buffer disabled", -35.f);
-                addLine(fmt::format("Stage {} | {}-{} ticks", g_settings.stage, g_settings.minTicks, g_settings.maxTicks), -62.f);
-                addLine("Spam logging is throttled to 250 ms.", -90.f);
-            } else if (g_tab == Tab::Modes) {
-                addLine("GAMEMODE TUNING", 0.f, {255, 150, 220});
-                addLine("Cube / Ship / Ball / UFO", -35.f);
-                addLine("Wave / Robot / Spider / Swing", -65.f);
-                addLine(fmt::format("Selected mode slot: {}", g_settings.mode + 1), -100.f);
-                addAction("PREVIOUS", 85.f, -145.f, menu_selector(Panel::modeDown));
-                addAction("NEXT", 220.f, -145.f, menu_selector(Panel::modeUp));
-            } else {
-                addLine("TOOLS", 0.f, {255, 150, 220});
-                addLine("Click maximum: 30 ticks", -35.f);
-                addLine("Release maximum: 60 ticks", -65.f);
-                addAction("TOGGLE BUFFER", 150.f, -110.f, menu_selector(Panel::toggle));
+            }
+            return true; // Consume even when the click is outside the panel.
+        }
+
+        void ccTouchMoved(CCTouch*, CCEvent*) override {}
+
+        void ccTouchEnded(CCTouch* touch, CCEvent*) override {
+            const int index = m_pressedButton;
+            m_pressedButton = -1;
+            if (index < 0 || index >= static_cast<int>(m_buttons.size())) return;
+            const auto point = m_panel->convertToNodeSpace(touch->getLocation());
+            const auto hit = m_buttons[index];
+            if (hit.rect.containsPoint(point) && hit.callback) hit.callback();
+            else if (hit.visual) hit.visual->runAction(CCScaleTo::create(0.10f, 1.f));
+        }
+
+        void ccTouchCancelled(CCTouch*, CCEvent*) override {
+            if (m_pressedButton >= 0 && m_pressedButton < static_cast<int>(m_buttons.size())) {
+                if (m_buttons[m_pressedButton].visual)
+                    m_buttons[m_pressedButton].visual->runAction(CCScaleTo::create(0.10f, 1.f));
+            }
+            m_pressedButton = -1;
+        }
+
+        void closeAnimated() {
+            if (m_closing) return;
+            m_closing = true;
+            m_panel->stopAllActions();
+            m_panel->runAction(CCEaseIn::create(CCScaleTo::create(0.15f, m_panelScale * 0.92f), 2.f));
+            m_shade->runAction(CCSequence::create(
+                CCFadeTo::create(0.14f, 0),
+                CCCallFunc::create(this, callfunc_selector(VisionXOverlay::finishClose)),
+                nullptr
+            ));
+        }
+
+    private:
+        void finishClose() {
+            if (g_overlay == this) g_overlay = nullptr;
+            removeFromParentAndCleanup(true);
+        }
+
+        CCNode* roundedRect(CCSize size, ccColor3B color, GLubyte opacity = 255) {
+            auto sprite = cocos2d::extension::CCScale9Sprite::create(
+                "square02b_001.png", CCRect(0.f, 0.f, 80.f, 80.f)
+            );
+            if (sprite) {
+                sprite->setContentSize(size);
+                sprite->setColor(color);
+                sprite->setOpacity(opacity);
+                return sprite;
+            }
+            return CCLayerColor::create({color.r, color.g, color.b, opacity}, size.width, size.height);
+        }
+
+        void buildPanelChrome() {
+            auto shadow = roundedRect({PANEL_W + 8.f, PANEL_H + 8.f}, {0, 0, 0}, 120);
+            shadow->setPosition({PANEL_W / 2.f, PANEL_H / 2.f - 4.f});
+            m_panel->addChild(shadow, -3);
+            auto body = roundedRect({PANEL_W, PANEL_H}, dark, 250);
+            body->setPosition({PANEL_W / 2.f, PANEL_H / 2.f});
+            m_panel->addChild(body, -2);
+            auto rail = roundedRect({138.f, 390.f}, {28, 24, 40}, 255);
+            rail->setPosition({77.f, 218.f});
+            m_panel->addChild(rail, -1);
+            auto accent = CCLayerColor::create({255, 125, 194, 255}, 420.f, 2.f);
+            accent->setPosition({166.f, 371.f});
+            m_panel->addChild(accent, 1);
+
+            auto logo = CCLabelBMFont::create("VISION X", "bigFont.fnt");
+            logo->setAnchorPoint({0.f, 0.5f});
+            logo->setPosition({166.f, 405.f});
+            logo->setScale(0.57f);
+            logo->setColor(palePink);
+            m_panel->addChild(logo, 3);
+
+            auto subtitle = CCLabelBMFont::create("PREDICTIVE INPUT BUFFER", "bigFont.fnt");
+            subtitle->setAnchorPoint({0.f, 0.5f});
+            subtitle->setPosition({169.f, 385.f});
+            subtitle->setScale(0.23f);
+            subtitle->setColor(muted);
+            m_panel->addChild(subtitle, 3);
+
+            auto dot = CCLayerColor::create({108, 235, 175, 255}, 7.f, 7.f);
+            dot->setPosition({528.f, 400.f});
+            m_panel->addChild(dot, 3);
+            auto ready = CCLabelBMFont::create("READY", "bigFont.fnt");
+            ready->setAnchorPoint({0.f, 0.5f});
+            ready->setPosition({540.f, 404.f});
+            ready->setScale(0.22f);
+            ready->setColor({171, 230, 190});
+            m_panel->addChild(ready, 3);
+        }
+
+        void addText(const std::string& value, CCPoint pos, float scale = 0.32f,
+                     ccColor3B color = {235, 231, 242}, CCPoint anchor = {0.f, 0.5f}) {
+            auto label = CCLabelBMFont::create(value.c_str(), "bigFont.fnt");
+            if (!label) return;
+            label->setAnchorPoint(anchor);
+            label->setPosition(pos);
+            label->setScale(scale);
+            label->setColor(color);
+            m_content->addChild(label, 2);
+        }
+
+        void addCard(CCPoint center, CCSize size, ccColor3B color = {34, 29, 47}) {
+            auto card = roundedRect(size, color, 246);
+            card->setPosition(center);
+            m_content->addChild(card, 0);
+        }
+
+        void addButton(const std::string& title, CCPoint center, CCSize size,
+                       std::function<void()> callback, bool selected = false,
+                       bool quiet = false, float labelScale = 0.30f) {
+            auto group = CCNode::create();
+            group->setContentSize(size);
+            group->setAnchorPoint({0.5f, 0.5f});
+            group->setPosition(center);
+            const auto bgColor = selected ? ccColor3B{224, 105, 171}
+                : quiet ? ccColor3B{49, 41, 62} : ccColor3B{73, 51, 82};
+            auto bg = roundedRect(size, bgColor, selected ? 255 : 235);
+            bg->setPosition({size.width / 2.f, size.height / 2.f});
+            group->addChild(bg, 0);
+            auto label = CCLabelBMFont::create(title.c_str(), "bigFont.fnt");
+            if (label) {
+                label->setPosition({size.width / 2.f, size.height / 2.f});
+                label->setScale(labelScale);
+                label->setColor(selected ? ccColor3B{255, 248, 253} : textColor);
+                group->addChild(label, 1);
+            }
+            m_content->addChild(group, 3);
+            m_buttons.push_back({
+                CCRect(center.x - size.width / 2.f, center.y - size.height / 2.f, size.width, size.height),
+                group, std::move(callback)
+            });
+        }
+
+        void addAdjust(const std::string& title, const std::string& value, float x, float y,
+                       std::function<void()> minus, std::function<void()> plus) {
+            addText(title, {x, y + 28.f}, 0.26f, palePink, {0.5f, 0.5f});
+            addText(value, {x, y - 2.f}, 0.40f, textColor, {0.5f, 0.5f});
+            addButton("-", {x - 48.f, y - 2.f}, {36.f, 28.f}, std::move(minus), false, true, 0.36f);
+            addButton("+", {x + 48.f, y - 2.f}, {36.f, 28.f}, std::move(plus), false, true, 0.36f);
+        }
+
+        void redraw() {
+            m_buttons.clear();
+            m_content->removeAllChildrenWithCleanup(true);
+            m_content->stopAllActions();
+            m_content->setPosition({PANEL_W / 2.f - 4.f, PANEL_H / 2.f});
+            m_content->setOpacity(0);
+            drawSidebar();
+            if (m_showTuning) drawTuningPage();
+            else drawMainPage();
+            m_content->runAction(CCSpawn::create(
+                CCFadeTo::create(0.16f, 255),
+                CCEaseOut::create(CCMoveTo::create(0.18f, {PANEL_W / 2.f, PANEL_H / 2.f}), 2.f),
+                nullptr
+            ));
+        }
+
+        void drawSidebar() {
+            struct Nav { const char* label; Tab tab; };
+            constexpr Nav nav[] = {
+                {"LOG", Tab::Log}, {"STAGES", Tab::Stages},
+                {"MODES", Tab::Modes}, {"TOOLS", Tab::Tools}
+            };
+            addText("NAVIGATION", {31.f, 374.f}, 0.21f, muted);
+            for (int i = 0; i < 4; ++i) {
+                const auto entry = nav[i];
+                const bool selected = !m_showTuning && m_tab == entry.tab;
+                addButton(entry.label, {77.f, 321.f - i * 58.f}, {112.f, 40.f},
+                    [this, tab = entry.tab] { m_tab = tab; m_showTuning = false; redraw(); },
+                    selected, !selected, 0.30f);
+            }
+            addText("LEFT ALT", {77.f, 52.f}, 0.25f, palePink, {0.5f, 0.5f});
+            addText("TOGGLE UI", {77.f, 35.f}, 0.18f, muted, {0.5f, 0.5f});
+        }
+
+        void drawMainPage() {
+            switch (m_tab) {
+                case Tab::Log: drawLog(); break;
+                case Tab::Stages: drawStages(); break;
+                case Tab::Modes: drawModes(); break;
+                case Tab::Tools: drawTools(); break;
             }
         }
 
-        std::array<SEL_MenuHandler, 6> stageCallbacks() {
-            return {menu_selector(Panel::stageOff), menu_selector(Panel::stage1),
-                    menu_selector(Panel::stage2), menu_selector(Panel::stage3),
-                    menu_selector(Panel::stageExtreme), menu_selector(Panel::stageCustom)};
+        void drawLog() {
+            addText("ACTIVITY LOG", {166.f, 344.f}, 0.39f, palePink);
+            addText("SESSION STATUS", {166.f, 300.f}, 0.24f, muted);
+            addCard({390.f, 238.f}, {430.f, 92.f});
+            addText(g_settings.enabled ? "Configuration enabled" : "Configuration disabled",
+                {190.f, 255.f}, 0.31f);
+            addText("Current stage: " + stageName(), {190.f, 227.f}, 0.27f, muted);
+            addText("Selected mode: " + std::string(MODE_NAMES[g_settings.selectedMode]),
+                {190.f, 201.f}, 0.27f, muted);
+            addCard({390.f, 116.f}, {430.f, 96.f});
+            addText("INPUT TUNING", {190.f, 145.f}, 0.25f, palePink);
+            addText("Per-mode values are configured in Stages > Open Tuning.",
+                {190.f, 116.f}, 0.22f);
+            addText("This panel displays configuration values only.",
+                {190.f, 91.f}, 0.20f, muted);
         }
 
-        void setStage(int stage, int ticks) {
-            g_settings.stage = stage;
-            g_settings.enabled = stage != 0;
-            g_settings.minTicks = std::clamp(ticks, 0, MAX_BUFFER_TICKS);
-            g_settings.maxTicks = std::clamp(ticks, 0, MAX_BUFFER_TICKS);
-            drawTab();
+        void drawStages() {
+            addText("STAGES", {166.f, 344.f}, 0.40f, palePink);
+            addText("Select a preset for the input buffer tuning range.",
+                {166.f, 320.f}, 0.22f, muted);
+            addCard({390.f, 270.f}, {438.f, 76.f}, {31, 26, 43});
+            for (int i = 0; i < 6; ++i) {
+                const float x = 195.f + i * 78.f;
+                addButton(STAGE_NAMES[i], {x, 270.f}, {i >= 4 ? 70.f : 60.f, 34.f},
+                    [this, i] { applyStage(i); redraw(); },
+                    g_settings.stage == i, g_settings.stage != i, i >= 4 ? 0.23f : 0.30f);
+            }
+            addText("TUNING OVERVIEW", {166.f, 205.f}, 0.28f, palePink);
+            addCard({390.f, 144.f}, {438.f, 94.f});
+            const auto& mode = g_settings.modes[g_settings.selectedMode];
+            addText("Selected mode: " + std::string(MODE_NAMES[g_settings.selectedMode]),
+                {190.f, 170.f}, 0.26f);
+            addText(fmt::format("Tick range: {} - {} ticks", mode.minTicks, mode.maxTicks),
+                {190.f, 144.f}, 0.25f, muted);
+            addText(fmt::format("Click: {} ticks   |   Release: {}", mode.clickTicks,
+                hasReleaseTuning(g_settings.selectedMode) ? fmt::format("{} ticks", mode.releaseTicks) : "N/A"),
+                {190.f, 119.f}, 0.23f, muted);
+            addButton("OPEN TUNING", {390.f, 69.f}, {220.f, 38.f},
+                [this] { m_showTuning = true; m_tuningPage = TuningPage::Tick; redraw(); }, true, false, 0.30f);
+            addText("Tick maximum: 80  |  Click maximum: 30  |  Release maximum: 60",
+                {166.f, 28.f}, 0.19f, muted);
         }
-        void stageOff(CCObject*) { setStage(0, 0); }
-        void stage1(CCObject*) { setStage(1, 2); }
-        void stage2(CCObject*) { setStage(2, 8); }
-        void stage3(CCObject*) { setStage(3, 24); }
-        void stageExtreme(CCObject*) { setStage(4, 48); }
-        void stageCustom(CCObject*) { g_settings.stage = 5; drawTab(); }
-        void minDown(CCObject*) { g_settings.minTicks = std::max(0, g_settings.minTicks - 1); drawTab(); }
-        void minUp(CCObject*) { g_settings.minTicks = std::min(g_settings.maxTicks, g_settings.minTicks + 1); drawTab(); }
-        void maxDown(CCObject*) { g_settings.maxTicks = std::max(g_settings.minTicks, g_settings.maxTicks - 1); drawTab(); }
-        void maxUp(CCObject*) { g_settings.maxTicks = std::min(MAX_BUFFER_TICKS, g_settings.maxTicks + 1); drawTab(); }
-        void modeDown(CCObject*) { g_settings.mode = (g_settings.mode + 7) % 8; drawTab(); }
-        void modeUp(CCObject*) { g_settings.mode = (g_settings.mode + 1) % 8; drawTab(); }
-        void toggle(CCObject*) { g_settings.enabled = !g_settings.enabled; drawTab(); }
+
+        void drawModes() {
+            addText("GAMEMODES", {166.f, 344.f}, 0.40f, palePink);
+            addText("Choose a gamemode to open its individual tuning controls.",
+                {166.f, 320.f}, 0.22f, muted);
+            drawModeGrid(270.f);
+            addText("Each gamemode keeps its own tick, click and release values.",
+                {166.f, 104.f}, 0.22f, muted);
+            addButton("OPEN SELECTED TUNING", {390.f, 66.f}, {230.f, 38.f},
+                [this] { m_showTuning = true; m_tuningPage = TuningPage::Tick; redraw(); }, true, false, 0.25f);
+        }
+
+        void drawTools() {
+            addText("TOOLS & SETTINGS", {166.f, 344.f}, 0.39f, palePink);
+            addText("VISUAL AND CONFIGURATION CONTROLS", {166.f, 315.f}, 0.21f, muted);
+            addCard({390.f, 238.f}, {430.f, 88.f});
+            addText("BUFFER CONFIGURATION", {190.f, 260.f}, 0.26f, palePink);
+            addText(g_settings.enabled ? "Status: enabled" : "Status: disabled", {190.f, 232.f}, 0.25f);
+            addButton(g_settings.enabled ? "DISABLE" : "ENABLE", {520.f, 243.f}, {105.f, 34.f},
+                [this] { g_settings.enabled = !g_settings.enabled; redraw(); }, g_settings.enabled, true, 0.24f);
+            addCard({390.f, 125.f}, {430.f, 100.f});
+            addText("RESET TUNING", {190.f, 150.f}, 0.27f, palePink);
+            addText("Restore the default ranges for all eight gamemodes.",
+                {190.f, 122.f}, 0.21f, muted);
+            addButton("RESET", {520.f, 121.f}, {105.f, 34.f},
+                [this] { resetTuning(); redraw(); }, false, true, 0.26f);
+            addText("Toggle the interface at any time with Left Alt.",
+                {166.f, 48.f}, 0.22f, muted);
+        }
+
+        void drawModeGrid(float centerY) {
+            constexpr float startX = 211.f;
+            constexpr float gapX = 91.f;
+            constexpr float gapY = 55.f;
+            for (int i = 0; i < 8; ++i) {
+                const int col = i % 4;
+                const int row = i / 4;
+                const CCPoint pos = {startX + col * gapX, centerY - row * gapY};
+                addButton(std::string(MODE_MARKS[i]) + "  " + MODE_NAMES[i], pos, {82.f, 40.f},
+                    [this, i] {
+                        g_settings.selectedMode = i;
+                        if (!m_showTuning) m_showTuning = true;
+                        m_tuningPage = TuningPage::Tick;
+                        redraw();
+                    }, g_settings.selectedMode == i, g_settings.selectedMode != i, 0.22f);
+            }
+        }
+
+        void drawTuningPage() {
+            const int modeIndex = std::clamp(g_settings.selectedMode, 0, 7);
+            auto& mode = g_settings.modes[modeIndex];
+            addText("GAMEMODE TUNING", {166.f, 344.f}, 0.37f, palePink);
+            addButton("BACK", {563.f, 344.f}, {72.f, 30.f},
+                [this] { m_showTuning = false; redraw(); }, false, true, 0.24f);
+            addButton("TICK TUNING", {285.f, 307.f}, {142.f, 34.f},
+                [this] { m_tuningPage = TuningPage::Tick; redraw(); },
+                m_tuningPage == TuningPage::Tick, m_tuningPage != TuningPage::Tick, 0.25f);
+            addButton("CLICK & RELEASE", {465.f, 307.f}, {166.f, 34.f},
+                [this] { m_tuningPage = TuningPage::ClickRelease; redraw(); },
+                m_tuningPage == TuningPage::ClickRelease, m_tuningPage != TuningPage::ClickRelease, 0.23f);
+            drawModeGrid(252.f);
+            addCard({390.f, 116.f}, {438.f, 94.f}, cardLight);
+
+            if (m_tuningPage == TuningPage::Tick) {
+                addText(std::string(MODE_NAMES[modeIndex]) + "  /  TICK RANGE",
+                    {190.f, 150.f}, 0.25f, palePink);
+                addAdjust("MIN TICKS", fmt::format("{}", mode.minTicks), 292.f, 105.f,
+                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.minTicks = std::max(0, v.minTicks - 1); redraw(); },
+                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.minTicks = std::min(v.maxTicks, v.minTicks + 1); redraw(); });
+                addAdjust("MAX TICKS", fmt::format("{}", mode.maxTicks), 488.f, 105.f,
+                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.maxTicks = std::max(v.minTicks, v.maxTicks - 1); redraw(); },
+                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.maxTicks = std::min(MAX_TICK_TUNING, v.maxTicks + 1); redraw(); });
+                addText("Per-mode minimum and maximum. Hard cap: 80 ticks.",
+                    {166.f, 42.f}, 0.20f, muted);
+            } else {
+                addText(std::string(MODE_NAMES[modeIndex]) + "  /  CLICK & RELEASE",
+                    {190.f, 150.f}, 0.24f, palePink);
+                addAdjust("CLICK TICKS", fmt::format("{}", mode.clickTicks), 292.f, 105.f,
+                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.clickTicks = std::max(0, v.clickTicks - 1); redraw(); },
+                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.clickTicks = std::min(MAX_CLICK_TUNING, v.clickTicks + 1); redraw(); });
+                if (hasReleaseTuning(modeIndex)) {
+                    addAdjust("RELEASE TICKS", fmt::format("{}", mode.releaseTicks), 488.f, 105.f,
+                        [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.releaseTicks = std::max(0, v.releaseTicks - 1); redraw(); },
+                        [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.releaseTicks = std::min(MAX_RELEASE_TUNING, v.releaseTicks + 1); redraw(); });
+                } else {
+                    addText("RELEASE", {488.f, 133.f}, 0.26f, palePink, {0.5f, 0.5f});
+                    addText("N/A", {488.f, 105.f}, 0.40f, muted, {0.5f, 0.5f});
+                }
+                addText("Click cap: 30 ticks  |  Release cap: 60 ticks",
+                    {166.f, 42.f}, 0.20f, muted);
+            }
+        }
     };
 
-    static void openPanel() {
-        if (!g_layer || g_panel) return;
-        auto panel = Panel::create();
-        if (!panel) return;
-        g_panel = panel;
-        g_layer->addChild(panel, 10000);
+    static void toggleOverlay() {
+        if (g_overlay) {
+            g_overlay->closeAnimated();
+            return;
+        }
+        auto overlay = VisionXOverlay::create();
+        if (!overlay) return;
+        g_overlay = overlay;
+        // Geode's OverlayManager is installed as the director notification node,
+        // so this panel survives scene changes and appears over pause/menu UI.
+        OverlayManager::get()->addChild(overlay, 100000);
     }
 }
 
-class $modify(VisionXPlayLayer, PlayLayer) {
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        vx::g_layer = this;
-        auto menu = CCMenu::create();
-        menu->setPosition({25.f, CCDirector::sharedDirector()->getWinSize().height - 28.f});
-        auto button = CCMenuItemLabel::create(CCLabelBMFont::create("VX", "bigFont.fnt"), this,
-            menu_selector(VisionXPlayLayer::onVisionX));
-        button->setColor({255, 145, 215});
-        button->setScale(0.55f);
-        menu->addChild(button);
-        this->addChild(menu, 9999);
-        return true;
-    }
-
-    void onVisionX(CCObject*) { vx::openPanel(); }
-
-    void onQuit() {
-        vx::g_panel = nullptr;
-        vx::g_layer = nullptr;
-        PlayLayer::onQuit();
-    }
-};
-
-// Keep the input hook lightweight: settings are bounded and repeated rapid calls
-// do not trigger synchronous console output or unbounded scans.
-class $modify(VisionXInputLayer, GJBaseGameLayer) {
-    void handleButton(bool down, int button, bool isPlayer1) {
-        if (vx::g_settings.enabled && button == 1) {
-            auto* pl = PlayLayer::get();
-            if (pl && pl->m_player1 && pl->m_player1->m_isDart) {
-                static int rapid = 0;
-                static auto last = std::chrono::steady_clock::time_point{};
-                auto now = std::chrono::steady_clock::now();
-                auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
-                rapid = gap < 34 ? rapid + 1 : 0;
-                last = now;
-                if (rapid >= 3) vx::logThrottled(3, "rapid wave input detected; bypassing extra scan");
-            }
+$on_game(Loaded) {
+    listenForKeybindSettingPresses("toggle-ui",
+        [](Keybind const&, bool down, bool repeat, double) {
+            if (down && !repeat) vx::toggleOverlay();
         }
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
-    }
-};
+    );
+}
