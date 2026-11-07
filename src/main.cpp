@@ -128,13 +128,24 @@ namespace vx {
 
         bool init() override {
             if (!CCLayer::init()) return false;
-            const auto win = CCDirector::sharedDirector()->getWinSize();
-            setContentSize(win);
+            auto* director = CCDirector::sharedDirector();
+            const auto visibleSize = director->getVisibleSize();
+            const auto visibleOrigin = director->getVisibleOrigin();
+
+            // Anchor the overlay to the visible game viewport, not the raw window size.
+            // This keeps the panel centered when the game uses a letterboxed viewport.
+            setContentSize(visibleSize);
+            setAnchorPoint({0.f, 0.f});
+            setPosition({0.f, 0.f});
             setTouchEnabled(true);
             setTouchMode(kCCTouchesOneByOne);
 
-            m_shade = CCLayerColor::create({5, 4, 12, 0}, win.width, win.height);
+            m_shade = CCLayerColor::create(
+                {5, 4, 12, 0}, visibleSize.width, visibleSize.height
+            );
             if (!m_shade) return false;
+            m_shade->setAnchorPoint({0.f, 0.f});
+            m_shade->setPosition(visibleOrigin);
             addChild(m_shade, 0);
 
             // CCLayerColor exposes opacity and cascading opacity support; CCNode does not.
@@ -142,10 +153,15 @@ namespace vx {
             if (!m_panel) return false;
             m_panel->setContentSize({PANEL_W, PANEL_H});
             m_panel->setAnchorPoint({0.5f, 0.5f});
-            m_panel->setPosition({win.width / 2.f, win.height / 2.f});
+            m_panel->setPosition({
+                visibleOrigin.x + visibleSize.width / 2.f,
+                visibleOrigin.y + visibleSize.height / 2.f
+            });
             m_panel->setCascadeOpacityEnabled(true);
-            const float fit = std::min((win.width - 28.f) / PANEL_W, (win.height - 28.f) / PANEL_H);
-            m_panelScale = std::clamp(fit, 0.55f, 1.f);
+            const float availableWidth = std::max(1.f, visibleSize.width - 48.f);
+            const float availableHeight = std::max(1.f, visibleSize.height - 48.f);
+            const float fit = std::min(availableWidth / PANEL_W, availableHeight / PANEL_H);
+            m_panelScale = std::clamp(fit, 0.30f, 1.f);
             m_panel->setScale(m_panelScale * 0.90f);
             addChild(m_panel, 10);
 
@@ -234,13 +250,112 @@ namespace vx {
             return CCLayerColor::create({color.r, color.g, color.b, opacity}, size.width, size.height);
         }
 
+        CCNode* makeEyeGraphic(float width, float height, GLubyte alpha) {
+            auto eye = CCNode::create();
+            auto drawing = CCDrawNode::create();
+            if (!eye || !drawing) return nullptr;
+
+            eye->setContentSize({width, height});
+            eye->setAnchorPoint({0.5f, 0.5f});
+
+            const float a = static_cast<float>(alpha) / 255.f;
+            const float cx = width * 0.5f;
+            const float cy = height * 0.5f;
+
+            // Draw the eye directly in Cocos so the design is bundled in the GUI,
+            // with no external texture or image asset needed.
+            CCPoint outline[] = {
+                {width * 0.03f, cy},
+                {width * 0.17f, height * 0.76f},
+                {width * 0.34f, height * 0.91f},
+                {cx, height * 0.97f},
+                {width * 0.66f, height * 0.91f},
+                {width * 0.83f, height * 0.76f},
+                {width * 0.97f, cy},
+                {width * 0.83f, height * 0.24f},
+                {width * 0.66f, height * 0.09f},
+                {cx, height * 0.03f},
+                {width * 0.34f, height * 0.09f},
+                {width * 0.17f, height * 0.24f}
+            };
+
+            drawing->drawPolygon(
+                outline, sizeof(outline) / sizeof(outline[0]),
+                ccColor4F{0.12f, 0.07f, 0.19f, a * 0.92f},
+                std::max(1.f, height * 0.018f),
+                ccColor4F{1.f, 0.34f, 0.68f, a}
+            );
+            drawing->drawDot({cx, cy}, height * 0.30f,
+                ccColor4F{1.f, 0.38f, 0.70f, a * 0.90f});
+            drawing->drawDot({cx, cy}, height * 0.225f,
+                ccColor4F{0.29f, 0.12f, 0.39f, a});
+            drawing->drawDot({cx, cy}, height * 0.115f,
+                ccColor4F{0.045f, 0.035f, 0.09f, a});
+            drawing->drawDot({cx - height * 0.075f, cy + height * 0.075f},
+                height * 0.042f, ccColor4F{1.f, 0.88f, 0.96f, a});
+            drawing->drawDot({cx + height * 0.07f, cy - height * 0.055f},
+                height * 0.020f, ccColor4F{1.f, 0.72f, 0.88f, a});
+            drawing->drawSegment(
+                {width * 0.20f, height * 0.73f},
+                {width * 0.80f, height * 0.73f},
+                std::max(0.8f, height * 0.012f),
+                ccColor4F{1.f, 0.58f, 0.80f, a * 0.82f}
+            );
+
+            eye->addChild(drawing);
+            return eye;
+        }
+
+        void addEyeBackdrop() {
+            // Large eye watermark inside the panel; the smaller eyes gently float
+            // behind the tabs and controls, rather than sitting on the game screen.
+            auto hero = makeEyeGraphic(252.f, 144.f, 66);
+            if (hero) {
+                hero->setPosition({418.f, 214.f});
+                hero->setRotation(-3.f);
+                hero->runAction(CCRepeatForever::create(CCSequence::create(
+                    CCScaleTo::create(2.4f, 1.035f),
+                    CCScaleTo::create(2.4f, 0.985f),
+                    nullptr
+                )));
+                m_panel->addChild(hero, -2);
+            }
+
+            struct FloatingEye {
+                float x, y, width, height, rise, duration;
+                GLubyte alpha;
+            };
+            const FloatingEye eyes[] = {
+                {210.f, 350.f, 40.f, 23.f, 5.f, 3.8f, 38},
+                {576.f, 348.f, 34.f, 20.f, 4.f, 4.6f, 34},
+                {588.f, 252.f, 42.f, 24.f, 5.f, 5.1f, 36},
+                {194.f, 188.f, 36.f, 21.f, 4.f, 4.2f, 32},
+                {575.f, 142.f, 42.f, 24.f, 5.f, 4.9f, 36},
+                {255.f, 72.f, 32.f, 18.f, 3.f, 5.4f, 32},
+                {520.f, 65.f, 38.f, 22.f, 4.f, 4.5f, 34}
+            };
+
+            for (const auto& spec : eyes) {
+                auto eye = makeEyeGraphic(spec.width, spec.height, spec.alpha);
+                if (!eye) continue;
+                eye->setPosition({spec.x, spec.y});
+                eye->runAction(CCRepeatForever::create(CCSequence::create(
+                    CCMoveBy::create(spec.duration, {0.f, spec.rise}),
+                    CCMoveBy::create(spec.duration, {0.f, -spec.rise}),
+                    nullptr
+                )));
+                m_panel->addChild(eye, -2);
+            }
+        }
+
         void buildPanelChrome() {
             auto shadow = roundedRect({PANEL_W + 8.f, PANEL_H + 8.f}, {0, 0, 0}, 120);
             shadow->setPosition({PANEL_W / 2.f, PANEL_H / 2.f - 4.f});
-            m_panel->addChild(shadow, -3);
+            m_panel->addChild(shadow, -4);
             auto body = roundedRect({PANEL_W, PANEL_H}, dark, 250);
             body->setPosition({PANEL_W / 2.f, PANEL_H / 2.f});
-            m_panel->addChild(body, -2);
+            m_panel->addChild(body, -3);
+            addEyeBackdrop();
             auto rail = roundedRect({138.f, 390.f}, {28, 24, 40}, 255);
             rail->setPosition({77.f, 218.f});
             m_panel->addChild(rail, -1);
