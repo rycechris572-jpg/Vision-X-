@@ -10,15 +10,28 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Build Geode mod
         id: build
         uses: geode-sdk/build-geode-mod@main
         with:
           target: Win64
           build-config: Release
+
       - name: Upload compiled mod
         uses: actions/upload-artifact@v4
         with:
           name: vision-x-windows
           path: ${{ steps.build.outputs.build-output }}
+          if-no-files-found: error
+
+      - name: Package source ZIP
+        shell: pwsh
+        run: git archive --format=zip --output=vision-x-source.zip HEAD
+
+      - name: Upload source ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: vision-x-source
+          path: vision-x-source.zip
           if-no-files-found: error
