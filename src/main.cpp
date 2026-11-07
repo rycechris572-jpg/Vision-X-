@@ -132,20 +132,35 @@ namespace vx {
             const auto visibleSize = director->getVisibleSize();
             const auto visibleOrigin = director->getVisibleOrigin();
 
-            // Anchor the overlay to the visible game viewport, not the raw window size.
-            // This keeps the panel centered when the game uses a letterboxed viewport.
-            setContentSize(visibleSize);
+            // OverlayManager has its own node transform. Convert screen coordinates
+            // into the manager's local space before positioning this child overlay.
+            setContentSize(director->getWinSize());
             setAnchorPoint({0.f, 0.f});
             setPosition({0.f, 0.f});
             setTouchEnabled(true);
             setTouchMode(kCCTouchesOneByOne);
 
+            auto* overlayManager = OverlayManager::get();
+            const CCPoint localBottomLeft = overlayManager->convertToNodeSpace(visibleOrigin);
+            const CCPoint localTopRight = overlayManager->convertToNodeSpace({
+                visibleOrigin.x + visibleSize.width,
+                visibleOrigin.y + visibleSize.height
+            });
+            const CCSize localVisibleSize = {
+                std::max(1.f, localTopRight.x - localBottomLeft.x),
+                std::max(1.f, localTopRight.y - localBottomLeft.y)
+            };
+            const CCPoint localCenter = {
+                (localBottomLeft.x + localTopRight.x) * 0.5f,
+                (localBottomLeft.y + localTopRight.y) * 0.5f
+            };
+
             m_shade = CCLayerColor::create(
-                {5, 4, 12, 0}, visibleSize.width, visibleSize.height
+                {5, 4, 12, 0}, localVisibleSize.width, localVisibleSize.height
             );
             if (!m_shade) return false;
             m_shade->setAnchorPoint({0.f, 0.f});
-            m_shade->setPosition(visibleOrigin);
+            m_shade->setPosition(localBottomLeft);
             addChild(m_shade, 0);
 
             // CCLayerColor exposes opacity and cascading opacity support; CCNode does not.
@@ -153,15 +168,18 @@ namespace vx {
             if (!m_panel) return false;
             m_panel->setContentSize({PANEL_W, PANEL_H});
             m_panel->setAnchorPoint({0.5f, 0.5f});
-            m_panel->setPosition({
-                visibleOrigin.x + visibleSize.width / 2.f,
-                visibleOrigin.y + visibleSize.height / 2.f
-            });
+            m_panel->setPosition(localCenter);
             m_panel->setCascadeOpacityEnabled(true);
-            const float availableWidth = std::max(1.f, visibleSize.width - 48.f);
-            const float availableHeight = std::max(1.f, visibleSize.height - 48.f);
-            const float fit = std::min(availableWidth / PANEL_W, availableHeight / PANEL_H);
-            m_panelScale = std::clamp(fit, 0.30f, 1.f);
+
+            // Slightly larger panel proportions, capped to the visible viewport.
+            constexpr float DESIGN_SCALE = 1.20f;
+            const float availableWidth = std::max(1.f, localVisibleSize.width - 40.f);
+            const float availableHeight = std::max(1.f, localVisibleSize.height - 40.f);
+            const float fit = std::min(
+                availableWidth / (PANEL_W * DESIGN_SCALE),
+                availableHeight / (PANEL_H * DESIGN_SCALE)
+            );
+            m_panelScale = DESIGN_SCALE * std::clamp(fit, 0.30f, 1.f);
             m_panel->setScale(m_panelScale * 0.90f);
             addChild(m_panel, 10);
 
@@ -307,15 +325,14 @@ namespace vx {
         }
 
         void addEyeBackdrop() {
-            // Large eye watermark inside the panel; the smaller eyes gently float
-            // behind the tabs and controls, rather than sitting on the game screen.
-            auto hero = makeEyeGraphic(252.f, 144.f, 66);
+            // A low-contrast eye watermark sits in the center of the GUI background.
+            auto hero = makeEyeGraphic(340.f, 196.f, 54);
             if (hero) {
-                hero->setPosition({418.f, 214.f});
-                hero->setRotation(-3.f);
+                hero->setPosition({320.f, 218.f});
+                hero->setRotation(-2.f);
                 hero->runAction(CCRepeatForever::create(CCSequence::create(
-                    CCScaleTo::create(2.4f, 1.035f),
-                    CCScaleTo::create(2.4f, 0.985f),
+                    CCScaleTo::create(2.8f, 1.025f),
+                    CCScaleTo::create(2.8f, 0.985f),
                     nullptr
                 )));
                 m_panel->addChild(hero, -2);
@@ -326,13 +343,14 @@ namespace vx {
                 GLubyte alpha;
             };
             const FloatingEye eyes[] = {
-                {210.f, 350.f, 40.f, 23.f, 5.f, 3.8f, 38},
-                {576.f, 348.f, 34.f, 20.f, 4.f, 4.6f, 34},
-                {588.f, 252.f, 42.f, 24.f, 5.f, 5.1f, 36},
-                {194.f, 188.f, 36.f, 21.f, 4.f, 4.2f, 32},
-                {575.f, 142.f, 42.f, 24.f, 5.f, 4.9f, 36},
-                {255.f, 72.f, 32.f, 18.f, 3.f, 5.4f, 32},
-                {520.f, 65.f, 38.f, 22.f, 4.f, 4.5f, 34}
+                {76.f, 338.f, 38.f, 22.f, 5.f, 4.0f, 38},
+                {216.f, 320.f, 30.f, 18.f, 4.f, 4.8f, 30},
+                {520.f, 336.f, 42.f, 24.f, 5.f, 4.4f, 36},
+                {580.f, 250.f, 32.f, 19.f, 4.f, 5.2f, 34},
+                {58.f, 190.f, 42.f, 24.f, 4.f, 4.6f, 34},
+                {566.f, 146.f, 38.f, 22.f, 4.f, 5.0f, 36},
+                {172.f, 80.f, 34.f, 20.f, 3.f, 5.4f, 31},
+                {440.f, 65.f, 42.f, 24.f, 5.f, 4.7f, 35}
             };
 
             for (const auto& spec : eyes) {
@@ -349,43 +367,34 @@ namespace vx {
         }
 
         void buildPanelChrome() {
-            auto shadow = roundedRect({PANEL_W + 8.f, PANEL_H + 8.f}, {0, 0, 0}, 120);
-            shadow->setPosition({PANEL_W / 2.f, PANEL_H / 2.f - 4.f});
+            auto shadow = roundedRect({PANEL_W + 10.f, PANEL_H + 10.f}, {0, 0, 0}, 155);
+            shadow->setPosition({PANEL_W / 2.f, PANEL_H / 2.f - 5.f});
             m_panel->addChild(shadow, -4);
-            auto body = roundedRect({PANEL_W, PANEL_H}, dark, 250);
+
+            auto body = roundedRect({PANEL_W, PANEL_H}, {15, 11, 25}, 252);
             body->setPosition({PANEL_W / 2.f, PANEL_H / 2.f});
             m_panel->addChild(body, -3);
+
             addEyeBackdrop();
-            auto rail = roundedRect({138.f, 390.f}, {28, 24, 40}, 255);
-            rail->setPosition({77.f, 218.f});
-            m_panel->addChild(rail, -1);
-            auto accent = CCLayerColor::create({255, 125, 194, 255}, 420.f, 2.f);
-            accent->setPosition({166.f, 371.f});
-            m_panel->addChild(accent, 1);
+
+            auto topLine = CCLayerColor::create({222, 142, 207, 225}, PANEL_W - 56.f, 2.f);
+            topLine->setPosition({28.f, 360.f});
+            m_panel->addChild(topLine, 1);
 
             auto logo = CCLabelBMFont::create("VISION X", "bigFont.fnt");
             logo->setAnchorPoint({0.f, 0.5f});
-            logo->setPosition({166.f, 405.f});
-            logo->setScale(0.57f);
+            logo->setPosition({30.f, 405.f});
+            logo->setScale(0.62f);
             logo->setColor(palePink);
             m_panel->addChild(logo, 3);
 
             auto subtitle = CCLabelBMFont::create("PREDICTIVE INPUT BUFFER", "bigFont.fnt");
             subtitle->setAnchorPoint({0.f, 0.5f});
-            subtitle->setPosition({169.f, 385.f});
-            subtitle->setScale(0.23f);
+            subtitle->setPosition({32.f, 383.f});
+            subtitle->setScale(0.21f);
             subtitle->setColor(muted);
             m_panel->addChild(subtitle, 3);
 
-            auto dot = CCLayerColor::create({108, 235, 175, 255}, 7.f, 7.f);
-            dot->setPosition({528.f, 400.f});
-            m_panel->addChild(dot, 3);
-            auto ready = CCLabelBMFont::create("READY", "bigFont.fnt");
-            ready->setAnchorPoint({0.f, 0.5f});
-            ready->setPosition({540.f, 404.f});
-            ready->setScale(0.22f);
-            ready->setColor({171, 230, 190});
-            m_panel->addChild(ready, 3);
         }
 
         void addText(const std::string& value, CCPoint pos, float scale = 0.32f,
@@ -400,9 +409,15 @@ namespace vx {
         }
 
         void addCard(CCPoint center, CCSize size, ccColor3B color = {34, 29, 47}) {
-            auto card = roundedRect(size, color, 246);
+            auto rim = roundedRect({size.width + 3.f, size.height + 3.f},
+                {108, 77, 133}, 210);
+            rim->setPosition(center);
+            m_content->addChild(rim, 0);
+
+            auto card = roundedRect({size.width - 2.f, size.height - 2.f},
+                color, 246);
             card->setPosition(center);
-            m_content->addChild(card, 0);
+            m_content->addChild(card, 1);
         }
 
         void addButton(const std::string& title, CCPoint center, CCSize size,
@@ -412,11 +427,22 @@ namespace vx {
             group->setContentSize(size);
             group->setAnchorPoint({0.5f, 0.5f});
             group->setPosition(center);
-            const auto bgColor = selected ? ccColor3B{224, 105, 171}
-                : quiet ? ccColor3B{49, 41, 62} : ccColor3B{73, 51, 82};
-            auto bg = roundedRect(size, bgColor, selected ? 255 : 235);
+            const auto bgColor = selected ? ccColor3B{231, 133, 196}
+                : quiet ? ccColor3B{43, 34, 56} : ccColor3B{91, 61, 105};
+            auto rim = roundedRect({size.width + 3.f, size.height + 3.f},
+                selected ? ccColor3B{255, 226, 244} : ccColor3B{125, 93, 145}, 245);
+            rim->setPosition({size.width / 2.f, size.height / 2.f});
+            group->addChild(rim, -1);
+            auto bg = roundedRect({size.width - 2.f, size.height - 2.f},
+                bgColor, selected ? 255 : 242);
             bg->setPosition({size.width / 2.f, size.height / 2.f});
             group->addChild(bg, 0);
+            auto gloss = CCLayerColor::create(
+                {255, 235, 248, selected ? (GLubyte)95 : (GLubyte)48},
+                std::max(8.f, size.width - 16.f), 1.f
+            );
+            gloss->setPosition({8.f, size.height - 6.f});
+            group->addChild(gloss, 1);
             auto label = CCLabelBMFont::create(title.c_str(), "bigFont.fnt");
             if (label) {
                 label->setPosition({size.width / 2.f, size.height / 2.f});
@@ -461,16 +487,20 @@ namespace vx {
                 {"LOG", Tab::Log}, {"STAGES", Tab::Stages},
                 {"MODES", Tab::Modes}, {"TOOLS", Tab::Tools}
             };
-            addText("NAVIGATION", {31.f, 374.f}, 0.21f, muted);
+            const float positions[] = {230.f, 320.f, 410.f, 500.f};
             for (int i = 0; i < 4; ++i) {
                 const auto entry = nav[i];
                 const bool selected = !m_showTuning && m_tab == entry.tab;
-                addButton(entry.label, {77.f, 321.f - i * 58.f}, {112.f, 40.f},
-                    [this, tab = entry.tab] { m_tab = tab; m_showTuning = false; redraw(); },
-                    selected, !selected, 0.30f);
+                addButton(entry.label, {positions[i], 405.f}, {76.f, 28.f},
+                    [this, tab = entry.tab] {
+                        m_tab = tab;
+                        m_showTuning = false;
+                        redraw();
+                    },
+                    selected, !selected, 0.25f);
             }
-            addText("LEFT ALT", {77.f, 52.f}, 0.25f, palePink, {0.5f, 0.5f});
-            addText("TOGGLE UI", {77.f, 35.f}, 0.18f, muted, {0.5f, 0.5f});
+            addButton("X", {604.f, 405.f}, {25.f, 25.f},
+                [this] { closeAnimated(); }, false, true, 0.25f);
         }
 
         void drawMainPage() {
@@ -483,140 +513,197 @@ namespace vx {
         }
 
         void drawLog() {
-            addText("ACTIVITY LOG", {166.f, 344.f}, 0.39f, palePink);
-            addText("SESSION STATUS", {166.f, 300.f}, 0.24f, muted);
-            addCard({390.f, 238.f}, {430.f, 92.f});
+            addText("ACTIVITY LOG", {30.f, 337.f}, 0.42f, palePink);
+            addText("SESSION STATUS", {30.f, 309.f}, 0.24f, muted);
+            addCard({320.f, 244.f}, {574.f, 98.f});
             addText(g_settings.enabled ? "Configuration enabled" : "Configuration disabled",
-                {190.f, 255.f}, 0.31f);
-            addText("Current stage: " + stageName(), {190.f, 227.f}, 0.27f, muted);
+                {54.f, 269.f}, 0.32f);
+            addText("Current stage: " + stageName(), {54.f, 239.f}, 0.27f, muted);
             addText("Selected mode: " + std::string(MODE_NAMES[g_settings.selectedMode]),
-                {190.f, 201.f}, 0.27f, muted);
-            addCard({390.f, 116.f}, {430.f, 96.f});
-            addText("INPUT TUNING", {190.f, 145.f}, 0.25f, palePink);
+                {54.f, 212.f}, 0.27f, muted);
+            addCard({320.f, 115.f}, {574.f, 100.f});
+            addText("INPUT TUNING", {54.f, 145.f}, 0.25f, palePink);
             addText("Per-mode values are configured in Stages > Open Tuning.",
-                {190.f, 116.f}, 0.22f);
+                {54.f, 115.f}, 0.23f);
             addText("This panel displays configuration values only.",
-                {190.f, 91.f}, 0.20f, muted);
+                {54.f, 87.f}, 0.21f, muted);
         }
 
         void drawStages() {
-            addText("STAGES", {166.f, 344.f}, 0.40f, palePink);
-            addText("Select a preset for the input buffer tuning range.",
-                {166.f, 320.f}, 0.22f, muted);
-            addCard({390.f, 270.f}, {438.f, 76.f}, {31, 26, 43});
+            addText("STAGE SELECT", {30.f, 337.f}, 0.42f, palePink);
+            addText("Choose a preset. Each stage sets the default input lookahead range.",
+                {30.f, 310.f}, 0.22f, muted);
+
+            // Six large pills in a dedicated wide selector, matching the reference layout.
+            addCard({320.f, 252.f}, {574.f, 104.f}, {29, 22, 39});
             for (int i = 0; i < 6; ++i) {
-                const float x = 195.f + i * 78.f;
-                addButton(STAGE_NAMES[i], {x, 270.f}, {i >= 4 ? 70.f : 60.f, 34.f},
+                const int col = i % 3;
+                const int row = i / 3;
+                const float x = 126.f + static_cast<float>(col) * 194.f;
+                const float y = 275.f - static_cast<float>(row) * 43.f;
+                const bool selected = g_settings.stage == i;
+                addButton(STAGE_NAMES[i], {x, y}, {174.f, 35.f},
                     [this, i] { applyStage(i); redraw(); },
-                    g_settings.stage == i, g_settings.stage != i, i >= 4 ? 0.23f : 0.30f);
+                    selected, !selected, i >= 4 ? 0.24f : 0.29f);
             }
-            addText("TUNING OVERVIEW", {166.f, 205.f}, 0.28f, palePink);
-            addCard({390.f, 144.f}, {438.f, 94.f});
+
+            addText("TICK TUNING", {30.f, 168.f}, 0.29f, palePink);
+            addCard({320.f, 112.f}, {574.f, 88.f});
             const auto& mode = g_settings.modes[g_settings.selectedMode];
             addText("Selected mode: " + std::string(MODE_NAMES[g_settings.selectedMode]),
-                {190.f, 170.f}, 0.26f);
-            addText(fmt::format("Tick range: {} - {} ticks", mode.minTicks, mode.maxTicks),
-                {190.f, 144.f}, 0.25f, muted);
-            addText(fmt::format("Click: {} ticks   |   Release: {}", mode.clickTicks,
-                hasReleaseTuning(g_settings.selectedMode) ? fmt::format("{} ticks", mode.releaseTicks) : "N/A"),
-                {190.f, 119.f}, 0.23f, muted);
-            addButton("OPEN TUNING", {390.f, 69.f}, {220.f, 38.f},
-                [this] { m_showTuning = true; m_tuningPage = TuningPage::Tick; redraw(); }, true, false, 0.30f);
-            addText("Tick maximum: 80  |  Click maximum: 30  |  Release maximum: 60",
-                {166.f, 28.f}, 0.19f, muted);
+                {54.f, 138.f}, 0.26f);
+            addText(fmt::format("Minimum: {} ticks      Maximum: {} ticks",
+                mode.minTicks, mode.maxTicks), {54.f, 111.f}, 0.25f, muted);
+            addText(fmt::format("Click: {} ticks      Release: {}",
+                mode.clickTicks,
+                hasReleaseTuning(g_settings.selectedMode)
+                    ? fmt::format("{} ticks", mode.releaseTicks) : "N/A"),
+                {54.f, 85.f}, 0.23f, muted);
+
+            addButton("OPEN TUNING", {320.f, 43.f}, {220.f, 34.f},
+                [this] { m_showTuning = true; m_tuningPage = TuningPage::Tick; redraw(); },
+                true, false, 0.29f);
         }
 
         void drawModes() {
-            addText("GAMEMODES", {166.f, 344.f}, 0.40f, palePink);
-            addText("Choose a gamemode to open its individual tuning controls.",
-                {166.f, 320.f}, 0.22f, muted);
-            drawModeGrid(270.f);
-            addText("Each gamemode keeps its own tick, click and release values.",
-                {166.f, 104.f}, 0.22f, muted);
-            addButton("OPEN SELECTED TUNING", {390.f, 66.f}, {230.f, 38.f},
-                [this] { m_showTuning = true; m_tuningPage = TuningPage::Tick; redraw(); }, true, false, 0.25f);
+            addText("GAMEMODES", {30.f, 337.f}, 0.42f, palePink);
+            addText("Choose a gamemode to configure its individual tick values.",
+                {30.f, 310.f}, 0.22f, muted);
+            drawModeGrid(260.f);
+            addText("Each gamemode keeps its own values.", {30.f, 125.f}, 0.23f, muted);
+            addButton("OPEN SELECTED TUNING", {320.f, 74.f}, {260.f, 38.f},
+                [this] { m_showTuning = true; m_tuningPage = TuningPage::Tick; redraw(); },
+                true, false, 0.25f);
         }
 
         void drawTools() {
-            addText("TOOLS & SETTINGS", {166.f, 344.f}, 0.39f, palePink);
-            addText("VISUAL AND CONFIGURATION CONTROLS", {166.f, 315.f}, 0.21f, muted);
-            addCard({390.f, 238.f}, {430.f, 88.f});
-            addText("BUFFER CONFIGURATION", {190.f, 260.f}, 0.26f, palePink);
-            addText(g_settings.enabled ? "Status: enabled" : "Status: disabled", {190.f, 232.f}, 0.25f);
-            addButton(g_settings.enabled ? "DISABLE" : "ENABLE", {520.f, 243.f}, {105.f, 34.f},
-                [this] { g_settings.enabled = !g_settings.enabled; redraw(); }, g_settings.enabled, true, 0.24f);
-            addCard({390.f, 125.f}, {430.f, 100.f});
-            addText("RESET TUNING", {190.f, 150.f}, 0.27f, palePink);
+            addText("TOOLS & SETTINGS", {30.f, 337.f}, 0.41f, palePink);
+            addText("VISUAL AND CONFIGURATION CONTROLS", {30.f, 309.f}, 0.22f, muted);
+            addCard({320.f, 242.f}, {574.f, 92.f});
+            addText("BUFFER CONFIGURATION", {54.f, 266.f}, 0.27f, palePink);
+            addText(g_settings.enabled ? "Status: enabled" : "Status: disabled",
+                {54.f, 235.f}, 0.25f);
+            addButton(g_settings.enabled ? "DISABLE" : "ENABLE", {535.f, 244.f}, {112.f, 35.f},
+                [this] { g_settings.enabled = !g_settings.enabled; redraw(); },
+                g_settings.enabled, true, 0.24f);
+            addCard({320.f, 125.f}, {574.f, 96.f});
+            addText("RESET TUNING", {54.f, 151.f}, 0.27f, palePink);
             addText("Restore the default ranges for all eight gamemodes.",
-                {190.f, 122.f}, 0.21f, muted);
-            addButton("RESET", {520.f, 121.f}, {105.f, 34.f},
+                {54.f, 122.f}, 0.22f, muted);
+            addButton("RESET", {535.f, 123.f}, {112.f, 35.f},
                 [this] { resetTuning(); redraw(); }, false, true, 0.26f);
             addText("Toggle the interface at any time with Left Alt.",
-                {166.f, 48.f}, 0.22f, muted);
+                {30.f, 45.f}, 0.22f, muted);
         }
 
         void drawModeGrid(float centerY) {
-            constexpr float startX = 211.f;
-            constexpr float gapX = 91.f;
-            constexpr float gapY = 55.f;
+            constexpr float startX = 106.f;
+            constexpr float gapX = 143.f;
+            constexpr float gapY = 57.f;
             for (int i = 0; i < 8; ++i) {
                 const int col = i % 4;
                 const int row = i / 4;
-                const CCPoint pos = {startX + col * gapX, centerY - row * gapY};
-                addButton(std::string(MODE_MARKS[i]) + "  " + MODE_NAMES[i], pos, {82.f, 40.f},
+                const CCPoint pos = {
+                    startX + static_cast<float>(col) * gapX,
+                    centerY - static_cast<float>(row) * gapY
+                };
+                addButton(std::string(MODE_MARKS[i]) + "  " + MODE_NAMES[i], pos,
+                    {130.f, 42.f},
                     [this, i] {
                         g_settings.selectedMode = i;
-                        if (!m_showTuning) m_showTuning = true;
+                        m_showTuning = true;
                         m_tuningPage = TuningPage::Tick;
                         redraw();
-                    }, g_settings.selectedMode == i, g_settings.selectedMode != i, 0.22f);
+                    },
+                    g_settings.selectedMode == i, g_settings.selectedMode != i, 0.23f);
             }
         }
 
         void drawTuningPage() {
             const int modeIndex = std::clamp(g_settings.selectedMode, 0, 7);
             auto& mode = g_settings.modes[modeIndex];
-            addText("GAMEMODE TUNING", {166.f, 344.f}, 0.37f, palePink);
-            addButton("BACK", {563.f, 344.f}, {72.f, 30.f},
+
+            addText("GAMEMODE TUNING", {30.f, 337.f}, 0.39f, palePink);
+            addButton("BACK", {584.f, 337.f}, {72.f, 30.f},
                 [this] { m_showTuning = false; redraw(); }, false, true, 0.24f);
-            addButton("TICK TUNING", {285.f, 307.f}, {142.f, 34.f},
+
+            addButton("TICK TUNING", {245.f, 297.f}, {160.f, 34.f},
                 [this] { m_tuningPage = TuningPage::Tick; redraw(); },
                 m_tuningPage == TuningPage::Tick, m_tuningPage != TuningPage::Tick, 0.25f);
-            addButton("CLICK & RELEASE", {465.f, 307.f}, {166.f, 34.f},
+            addButton("CLICK & RELEASE", {438.f, 297.f}, {190.f, 34.f},
                 [this] { m_tuningPage = TuningPage::ClickRelease; redraw(); },
-                m_tuningPage == TuningPage::ClickRelease, m_tuningPage != TuningPage::ClickRelease, 0.23f);
-            drawModeGrid(252.f);
-            addCard({390.f, 116.f}, {438.f, 94.f}, cardLight);
+                m_tuningPage == TuningPage::ClickRelease,
+                m_tuningPage != TuningPage::ClickRelease, 0.23f);
 
+            // Eight compact mode tiles remain separate from the tuning controls.
+            for (int i = 0; i < 8; ++i) {
+                const float x = 52.f + static_cast<float>(i) * 76.5f;
+                addButton(MODE_MARKS[i], {x, 235.f}, {62.f, 32.f},
+                    [this, i] { g_settings.selectedMode = i; redraw(); },
+                    modeIndex == i, modeIndex != i, 0.26f);
+            }
+
+            addCard({320.f, 125.f}, {574.f, 112.f}, {38, 29, 50});
             if (m_tuningPage == TuningPage::Tick) {
                 addText(std::string(MODE_NAMES[modeIndex]) + "  /  TICK RANGE",
-                    {190.f, 150.f}, 0.25f, palePink);
-                addAdjust("MIN TICKS", fmt::format("{}", mode.minTicks), 292.f, 105.f,
-                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.minTicks = std::max(0, v.minTicks - 1); redraw(); },
-                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.minTicks = std::min(v.maxTicks, v.minTicks + 1); redraw(); });
-                addAdjust("MAX TICKS", fmt::format("{}", mode.maxTicks), 488.f, 105.f,
-                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.maxTicks = std::max(v.minTicks, v.maxTicks - 1); redraw(); },
-                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.maxTicks = std::min(MAX_TICK_TUNING, v.maxTicks + 1); redraw(); });
-                addText("Per-mode minimum and maximum. Hard cap: 80 ticks.",
-                    {166.f, 42.f}, 0.20f, muted);
+                    {54.f, 158.f}, 0.26f, palePink);
+                addAdjust("MIN TICKS", fmt::format("{}", mode.minTicks), 205.f, 112.f,
+                    [this, modeIndex] {
+                        auto& v = g_settings.modes[modeIndex];
+                        v.minTicks = std::max(0, v.minTicks - 1);
+                        redraw();
+                    },
+                    [this, modeIndex] {
+                        auto& v = g_settings.modes[modeIndex];
+                        v.minTicks = std::min(v.maxTicks, v.minTicks + 1);
+                        redraw();
+                    });
+                addAdjust("MAX TICKS", fmt::format("{}", mode.maxTicks), 435.f, 112.f,
+                    [this, modeIndex] {
+                        auto& v = g_settings.modes[modeIndex];
+                        v.maxTicks = std::max(v.minTicks, v.maxTicks - 1);
+                        redraw();
+                    },
+                    [this, modeIndex] {
+                        auto& v = g_settings.modes[modeIndex];
+                        v.maxTicks = std::min(MAX_TICK_TUNING, v.maxTicks + 1);
+                        redraw();
+                    });
             } else {
                 addText(std::string(MODE_NAMES[modeIndex]) + "  /  CLICK & RELEASE",
-                    {190.f, 150.f}, 0.24f, palePink);
-                addAdjust("CLICK TICKS", fmt::format("{}", mode.clickTicks), 292.f, 105.f,
-                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.clickTicks = std::max(0, v.clickTicks - 1); redraw(); },
-                    [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.clickTicks = std::min(MAX_CLICK_TUNING, v.clickTicks + 1); redraw(); });
+                    {54.f, 158.f}, 0.25f, palePink);
+                addAdjust("CLICK TICKS", fmt::format("{}", mode.clickTicks), 205.f, 112.f,
+                    [this, modeIndex] {
+                        auto& v = g_settings.modes[modeIndex];
+                        v.clickTicks = std::max(0, v.clickTicks - 1);
+                        redraw();
+                    },
+                    [this, modeIndex] {
+                        auto& v = g_settings.modes[modeIndex];
+                        v.clickTicks = std::min(MAX_CLICK_TUNING, v.clickTicks + 1);
+                        redraw();
+                    });
                 if (hasReleaseTuning(modeIndex)) {
-                    addAdjust("RELEASE TICKS", fmt::format("{}", mode.releaseTicks), 488.f, 105.f,
-                        [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.releaseTicks = std::max(0, v.releaseTicks - 1); redraw(); },
-                        [this, modeIndex] { auto& v = g_settings.modes[modeIndex]; v.releaseTicks = std::min(MAX_RELEASE_TUNING, v.releaseTicks + 1); redraw(); });
+                    addAdjust("RELEASE TICKS", fmt::format("{}", mode.releaseTicks), 435.f, 112.f,
+                        [this, modeIndex] {
+                            auto& v = g_settings.modes[modeIndex];
+                            v.releaseTicks = std::max(0, v.releaseTicks - 1);
+                            redraw();
+                        },
+                        [this, modeIndex] {
+                            auto& v = g_settings.modes[modeIndex];
+                            v.releaseTicks = std::min(MAX_RELEASE_TUNING, v.releaseTicks + 1);
+                            redraw();
+                        });
                 } else {
-                    addText("RELEASE", {488.f, 133.f}, 0.26f, palePink, {0.5f, 0.5f});
-                    addText("N/A", {488.f, 105.f}, 0.40f, muted, {0.5f, 0.5f});
+                    addText("RELEASE", {435.f, 139.f}, 0.26f, palePink, {0.5f, 0.5f});
+                    addText("N/A", {435.f, 111.f}, 0.40f, muted, {0.5f, 0.5f});
                 }
-                addText("Click cap: 30 ticks  |  Release cap: 60 ticks",
-                    {166.f, 42.f}, 0.20f, muted);
             }
+            addText("Values are saved independently for each gamemode.",
+                {30.f, 42.f}, 0.21f, muted);
         }
+
     };
 
     static void toggleOverlay() {
