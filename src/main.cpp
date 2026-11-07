@@ -153,6 +153,9 @@ namespace vx {
             if (!m_panel) return false;
             m_panel->setContentSize({PANEL_W, PANEL_H});
             m_panel->setAnchorPoint({0.5f, 0.5f});
+            // CCLayer ignores its anchor point by default. The panel is positioned
+            // by its center, so explicitly restore normal anchor-point transforms.
+            m_panel->ignoreAnchorPointForPosition(false);
             m_panel->setPosition({winSize.width / 2.f, winSize.height / 2.f});
             m_panel->setCascadeOpacityEnabled(true);
             m_panel->setScale(0.90f);
@@ -165,6 +168,8 @@ namespace vx {
             m_content->setCascadeOpacityEnabled(true);
             m_content->setContentSize({PANEL_W, PANEL_H});
             m_content->setAnchorPoint({0.5f, 0.5f});
+            // Same CCLayer anchor behaviour: align the content layer by its center.
+            m_content->ignoreAnchorPointForPosition(false);
             m_content->setPosition({PANEL_W / 2.f, PANEL_H / 2.f});
             m_panel->addChild(m_content, 5);
             return true;
@@ -284,7 +289,14 @@ namespace vx {
                 sprite->setOpacity(opacity);
                 return sprite;
             }
-            return CCLayerColor::create({color.r, color.g, color.b, opacity}, size.width, size.height);
+            auto fallback = CCLayerColor::create(
+                {color.r, color.g, color.b, opacity}, size.width, size.height
+            );
+            if (fallback) {
+                fallback->setAnchorPoint({0.5f, 0.5f});
+                fallback->ignoreAnchorPointForPosition(false);
+            }
+            return fallback;
         }
 
         CCNode* makeEyeGraphic(float width, float height, GLubyte alpha) {
