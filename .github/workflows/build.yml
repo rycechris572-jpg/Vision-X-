@@ -1,4 +1,4 @@
-name: Build Predictive Buffer (Windows)
+name: Build VISION X (Windows)
 on:
   workflow_dispatch:
   push:
@@ -19,6 +19,6 @@ jobs:
       - name: Upload compiled mod
         uses: actions/upload-artifact@v4
         with:
-          name: predictive-buffer-windows
+          name: vision-x-windows
           path: ${{ steps.build.outputs.build-output }}
           if-no-files-found: error
