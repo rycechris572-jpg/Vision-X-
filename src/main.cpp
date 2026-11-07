@@ -1,680 +1,259 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/LevelEditorLayer.hpp>
-#include <Geode/modify/GameObject.hpp>
-#include <Geode/modify/EffectGameObject.hpp>
-#include <Geode/modify/HardStreak.hpp>
-#include <Windows.h>
-#include <cstdio>
+#include <Geode/modify/PlayerObject.hpp>
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <string>
 
 using namespace geode::prelude;
 
-// ============================================================================
-//  USER SETTINGS
-// ============================================================================
+// VISION X source foundation: bounded input-buffer settings + in-level control panel.
+// Maximum supported tuning is deliberately capped at 60 ticks.
+namespace vx {
+    constexpr int MAX_BUFFER_TICKS = 60;
+    constexpr int MAX_CLICK_TICKS = 30;
 
-// True Wave Spam Guard: only bypasses the buffer if you do at least
-// SPAM_STREAK_REQUIRED consecutive inputs faster than SPAM_INTERVAL_TICKS apart.
-// This keeps isolated micro-clicks and spike/sawblade dodges 100% protected!
-constexpr int SPAM_INTERVAL_TICKS = 8;
-constexpr int SPAM_STREAK_REQUIRED = 3;
+    enum class Tab { Log, Stages, Modes, Tools };
 
-// ============================================================================
+    struct Settings {
+        bool enabled = true;
+        int stage = 1;
+        int minTicks = 2;
+        int maxTicks = 2;
+        int clickMin = 0;
+        int clickMax = 0;
+        int releaseMin = 0;
+        int releaseMax = 0;
+        int mode = 0;
+    };
 
-static void refreshBufferHud();
+    static Settings g_settings;
+    static PlayLayer* g_layer = nullptr;
+    static CCNode* g_panel = nullptr;
+    static CCNode* g_content = nullptr;
+    static CCLabelBMFont* g_status = nullptr;
+    static Tab g_tab = Tab::Stages;
+    static std::chrono::steady_clock::time_point g_lastLog{};
+    static int g_lastLogCode = -1;
 
-class TrajectoryBufferSim {
-private:
-    PlayerObject* m_simPlayer1 = nullptr;
-    PlayerObject* m_simPlayer2 = nullptr;
-
-    bool m_simulating = false;
-    bool m_firingBuffered = false;
-    bool m_simulationDead = false;
-
-    // Tracks actual physical mouse state vs what PlayLayer currently has active
-    bool m_physicalHolding = false;
-    bool m_gameHolding = false;
-
-    // F6 Cycle State (Starts on Stage 0: 2 ticks Normal / 2 ticks Wave)
-    int  m_presetIndex = 0;
-    bool m_enabled = true;
-    int  m_maxTicksNormal = 2;
-    int  m_maxTicksWave = 2;
-
-    // Buffer state
-    int  m_waitTicks = -1;          // -1 = inactive, >= 0 = countdown ticks, -2 = queued opposite tick
-    bool m_bufferedPush = true;     // true = buffered PRESS, false = buffered RELEASE
-    bool m_queuedOpposite = false;  // true if user quickly released/re-pressed during wait
-    float m_frameDt = 0.25f;        // GD 240 TPS normalized dt is 0.25f
-
-    // Streak-based Spam Guard state
-    int  m_ticksSinceLastInput = 999;
-    int  m_rapidInputStreak = 0;
-
-    PlayerObject* createTrajectoryPlayer() {
-        PlayLayer* pl = PlayLayer::get();
-        if (!pl) return nullptr;
-
-        PlayerObject* player = PlayerObject::create(1, 1, pl, pl, true);
-        player->retain();
-        player->setPosition({0, 105});
-        player->setVisible(false);
-        pl->m_objectLayer->addChild(player);
-        return player;
-    }
-
-    void resetCollisionLog(PlayerObject* self) {
-        self->m_collisionLogTop->removeAllObjects();
-        self->m_collisionLogBottom->removeAllObjects();
-        self->m_collisionLogLeft->removeAllObjects();
-        self->m_collisionLogRight->removeAllObjects();
-    }
-
-    // Matches Show Trajectory's exact attribute + hitbox size synchronization
-    void syncSimPlayer(PlayerObject* sim, PlayerObject* real) {
-        sim->setVisible(false);
-        sim->copyAttributes(real);
-        sim->setScale(real->getScale());
-        sim->setContentSize(real->getContentSize());
-        sim->m_width = real->m_width;
-        sim->m_height = real->m_height;
-        sim->m_gravityMod = real->m_gravityMod;
-        sim->m_isOnGround = real->m_isOnGround;
-        sim->m_isUpsideDown = real->m_isUpsideDown;
-        sim->m_vehicleSize = real->m_vehicleSize;
-        sim->m_playerSpeed = real->m_playerSpeed;
-    }
-
-    float getValidDt() const {
-        if (m_frameDt > 0.001f && m_frameDt < 2.0f) {
-            return m_frameDt;
-        }
-        return 0.25f;
-    }
-
-public:
-    void init() {
-        PlayLayer* pl = PlayLayer::get();
-        if (!pl) return;
-
-        m_simPlayer1 = createTrajectoryPlayer();
-        m_simPlayer2 = createTrajectoryPlayer();
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
-        m_physicalHolding = false;
-        m_gameHolding = false;
-        m_simulating = false;
-        m_firingBuffered = false;
-        m_ticksSinceLastInput = 999;
-        m_rapidInputStreak = 0;
-    }
-
-    void quit() {
-        if (m_simPlayer1) {
-            m_simPlayer1->release();
-            m_simPlayer1 = nullptr;
-        }
-        if (m_simPlayer2) {
-            m_simPlayer2->release();
-            m_simPlayer2 = nullptr;
-        }
-        m_simulating = false;
-        m_firingBuffered = false;
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
-        m_rapidInputStreak = 0;
-    }
-
-    // F6 cycles through 10 buffer presets and OFF.
-    // Single-value presets use the same tick limit for normal and wave.
-    void cyclePreset() {
-        m_presetIndex = (m_presetIndex + 1) % 11;
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
-
-        constexpr int normalTicks[] = {2, 4, 8, 16, 24, 32, 48, 54, 60, 120, 0};
-        constexpr int waveTicks[]   = {2, 4, 8,  8, 24, 32, 48, 54, 60, 120, 0};
-        m_enabled = m_presetIndex != 10;
-        m_maxTicksNormal = normalTicks[m_presetIndex];
-        m_maxTicksWave = waveTicks[m_presetIndex];
-
-        if (m_enabled) {
-            printf("[InputBuffer] F6 Cycle -> STAGE %d: %d Ticks All | %d Ticks Wave\n",
-                   m_presetIndex + 1, m_maxTicksNormal, m_maxTicksWave);
-        } else {
-            printf("[InputBuffer] F6 Cycle -> STAGE 11: OFF (100%% Raw Input)\n");
-        }
-    }
-
-    int normalTicks() const { return m_maxTicksNormal; }
-    int waveTicks() const { return m_maxTicksWave; }
-    bool enabled() const { return m_enabled; }
-    bool isSimulating() const { return m_simulating; }
-    bool isFiringBuffered() const { return m_firingBuffered; }
-
-    bool checkSimulationDeath(PlayerObject* player) {
-        if (m_simulating && (player == m_simPlayer1 || player == m_simPlayer2)) {
-            m_simulationDead = true;
-            return true;
-        }
-        // Real player died -> clear any pending buffer so respawn is 100% clean
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
-        m_gameHolding = false;
-        m_rapidInputStreak = 0;
-        return false;
-    }
-
-    void setFrameDelta(float dt) {
-        PlayLayer* pl = PlayLayer::get();
-        if (pl && pl->m_gameState.m_timeWarp > 0.f) {
-            m_frameDt = dt / pl->m_gameState.m_timeWarp;
-        } else {
-            m_frameDt = dt;
-        }
-    }
-
-    int getSurvivalTicks(PlayLayer* pl, PlayerObject* realP1, PlayerObject* realP2, bool isDual, int delayFrames, bool actionPush, int maxTicks) {
-        if (!pl || !m_simPlayer1 || !realP1) return maxTicks;
-
-        m_simulating = true;
-        m_simulationDead = false;
-
-        syncSimPlayer(m_simPlayer1, realP1);
-        if (isDual && m_simPlayer2 && realP2) {
-            syncSimPlayer(m_simPlayer2, realP2);
-        }
-
-        // Before delayFrames, maintain the pre-input button state
-        if (delayFrames > 0) {
-            if (!actionPush) {
-                m_simPlayer1->pushButton(PlayerButton::Jump);
-                if (isDual && m_simPlayer2) {
-                    m_simPlayer2->pushButton(PlayerButton::Jump);
-                }
-            } else {
-                m_simPlayer1->releaseButton(PlayerButton::Jump);
-                if (isDual && m_simPlayer2) {
-                    m_simPlayer2->releaseButton(PlayerButton::Jump);
-                }
-            }
-        }
-
-        float dt = getValidDt();
-        int survived = 0;
-        bool isContinuousMode = realP1->m_isDart || realP1->m_isBird || realP1->m_isSwing ||
-                                (isDual && realP2 && (realP2->m_isDart || realP2->m_isBird || realP2->m_isSwing));
-        int airborneTicks = 0;
-        int safeLandedTicks = 0;
-
-        for (int i = 0; i < delayFrames + maxTicks; i++) {
-            if (i == delayFrames) {
-                if (actionPush) {
-                    m_simPlayer1->pushButton(PlayerButton::Jump);
-                    if (isDual && m_simPlayer2) {
-                        m_simPlayer2->pushButton(PlayerButton::Jump);
-                    }
-                } else {
-                    m_simPlayer1->releaseButton(PlayerButton::Jump);
-                    if (isDual && m_simPlayer2) {
-                        m_simPlayer2->releaseButton(PlayerButton::Jump);
-                    }
-                }
-            }
-
-            m_simPlayer1->update(dt);
-            m_simPlayer1->updateRotation(dt);
-            if (isDual && m_simPlayer2) {
-                m_simPlayer2->update(dt);
-                m_simPlayer2->updateRotation(dt);
-            }
-            if (m_simulationDead) break;
-
-            resetCollisionLog(m_simPlayer1);
-            pl->checkCollisions(m_simPlayer1, dt, false);
-            if (m_simulationDead) break;
-
-            if (isDual && m_simPlayer2 && realP2) {
-                resetCollisionLog(m_simPlayer2);
-                pl->checkCollisions(m_simPlayer2, dt, false);
-                if (m_simulationDead) break;
-            }
-
-            if (i >= delayFrames) {
-                survived++;
-                if (!isContinuousMode) {
-                    bool p1Grounded = m_simPlayer1->m_isOnGround;
-                    bool p2Grounded = (!isDual || !m_simPlayer2) ? true : m_simPlayer2->m_isOnGround;
-                    if (!p1Grounded || !p2Grounded) {
-                        airborneTicks++;
-                        safeLandedTicks = 0;
-                    } else if (airborneTicks >= 15) {
-                        safeLandedTicks++;
-                        if (safeLandedTicks >= 10) {
-                            survived = maxTicks;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        m_simulating = false;
-        return survived;
-    }
-
-    bool interceptInput(GJBaseGameLayer* layer, bool push, bool isPlayer1) {
-        PlayLayer* pl = PlayLayer::get();
-        if (!pl) return true;
-
-        bool isDual = pl->m_gameState.m_isDualMode && pl->m_player2 != nullptr;
-        bool isTwoPlayerControl = pl->m_level && pl->m_level->m_twoPlayerMode;
-
-        // Keep Player 2 synced with Player 1 in 1-player Dual mode
-        if (!isPlayer1) {
-            if (isDual && !isTwoPlayerControl && (m_waitTicks >= 0 || m_waitTicks == -2)) {
-                return false;
-            }
-            return true;
-        }
-
-        // Always record the user's true physical mouse/key state first!
-        m_physicalHolding = push;
-
-        if (!m_enabled) {
-            m_gameHolding = push;
-            return true;
-        }
-
-        PlayerObject* p1 = layer->m_player1;
-        PlayerObject* p2 = isDual ? pl->m_player2 : nullptr;
-        if (!p1 || p1->m_isDead) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
-            m_gameHolding = push;
-            return true;
-        }
-
-        // 1. NEVER touch Ship mode (or Dual with Ship)
-        if (p1->m_isShip || (isDual && p2 && p2->m_isShip)) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
-            m_gameHolding = push;
-            return true;
-        }
-
-        // 2. If an input is currently waiting in the buffer and the user quickly releases
-        // (or re-presses) 1-2 ticks later, queue it for the next tick so fast taps are never eaten
-        if (m_waitTicks >= 0) {
-            if (push != m_bufferedPush) {
-                m_queuedOpposite = true;
-            } else {
-                m_queuedOpposite = false;
-            }
-            m_ticksSinceLastInput = 0;
-            return false;
-        }
-
-        // If a queued opposite action is due to fire on the next tick (m_waitTicks == -2)
-        // and the user clicks again, fire the pending opposite action first
-        if (m_waitTicks == -2) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
-            if (m_gameHolding != !m_bufferedPush) {
-                m_SimFireButton(pl, !m_bufferedPush);
-            }
-        }
-
-        bool isWave = p1->m_isDart || (isDual && p2 && p2->m_isDart);
-        bool isMiniWave = (p1->m_isDart && p1->m_vehicleSize < 1.0f) ||
-                          (isDual && p2 && p2->m_isDart && p2->m_vehicleSize < 1.0f);
-
-        // 3. STREAK-BASED WAVE SPAM GUARD:
-        // Only bypasses if you perform 3+ rapid inputs in a row (< 8 ticks apart).
-        // Single micro-clicks and normal Wave turns around spikes/sawblades stay 100% active!
-        if (m_ticksSinceLastInput < SPAM_INTERVAL_TICKS) {
-            m_rapidInputStreak++;
-        } else {
-            m_rapidInputStreak = 0;
-        }
-        m_ticksSinceLastInput = 0;
-
-        if (isWave && m_rapidInputStreak >= SPAM_STREAK_REQUIRED) {
-            m_gameHolding = push;
-            return true;
-        }
-
-        // Only Wave (m_isDart) and Robot (m_isRobot) change trajectory on RELEASE
-        bool releaseAffectsPhysics = p1->m_isDart || p1->m_isRobot ||
-                                     (isDual && p2 && (p2->m_isDart || p2->m_isRobot));
-        if (!push && !releaseAffectsPhysics) {
-            m_gameHolding = false;
-            return true;
-        }
-
-        m_queuedOpposite = false;
-        const char* act = push ? "PRESS" : "RELEASE";
-
-        // Full Show-Trajectory lookahead for Wave (65 ticks / 50 ticks Mini Wave)
-        // so it sees spikes and sawblades 1-3 blocks ahead along the diagonal path!
-        int targetHorizon = isMiniWave ? 50 : (isWave ? 65 : 160);
-        int maxDelayFrames = isWave ? m_maxTicksWave : m_maxTicksNormal;
-
-        // 4. Check Frame 0 (immediate input) across the full trajectory horizon
-        int ticksFrame0 = getSurvivalTicks(pl, p1, p2, isDual, 0, push, targetHorizon);
-        if (ticksFrame0 >= targetHorizon) {
-            m_gameHolding = push;
-            return true;
-        }
-
-        // 5. Frame 0 hits a spike, sawblade, or slope within the horizon!
-        // Scan +1..maxDelayFrames for the earliest delay that genuinely clears the obstacle.
-        int bestDelay = 0;
-        int bestTicks = ticksFrame0;
-
-        for (int delay = 1; delay <= maxDelayFrames; delay++) {
-            int ticks = getSurvivalTicks(pl, p1, p2, isDual, delay, push, targetHorizon);
-
-            if (isWave) {
-                // In Wave mode, delaying a turn inside a flat corridor naturally adds ~(2 * delay)
-                // ticks against the opposite wall. Require at least (2 * delay + 10) extra ticks
-                // so we ONLY buffer when the delayed trajectory actually clears past a spike,
-                // sawblade, or corner!
-                int minClearedGain = (delay * 2) + 10;
-                if (ticks >= targetHorizon && (ticks - ticksFrame0) >= (delay * 2) + 6) {
-                    bestDelay = delay;
-                    bestTicks = ticks;
-                    break;
-                }
-                if (ticks >= ticksFrame0 + minClearedGain && ticks > bestTicks + 2) {
-                    bestDelay = delay;
-                    bestTicks = ticks;
-                    if (ticks >= targetHorizon) break;
-                }
-            } else {
-                if (ticks >= targetHorizon) {
-                    bestDelay = delay;
-                    bestTicks = ticks;
-                    break;
-                }
-                if (ticks > bestTicks + 12) {
-                    bestDelay = delay;
-                    bestTicks = ticks;
-                }
-            }
-        }
-
-        if (bestDelay > 0) {
-            printf("[InputBuffer] *** SAVED +%d TICKS (%.2f frames @ 60fps) %s! (Frame0: %d -> Delayed: %d) [Limit: %d] ***\n",
-                bestDelay, bestDelay / 4.0f, act, ticksFrame0, bestTicks, maxDelayFrames);
-            m_bufferedPush = push;
-            m_waitTicks = bestDelay;
-            return false;
-        }
-
-        m_gameHolding = push;
-        return true;
-    }
-
-    void onPlayerUpdate(PlayerObject* player) {
-        PlayLayer* pl = PlayLayer::get();
-        if (!pl || player != pl->m_player1) return;
-
-        // Check F6 before m_enabled check so you can always cycle back ON when it is OFF!
-        if (GetAsyncKeyState(VK_F6) & 1) {
-            cyclePreset();
-            refreshBufferHud();
-        }
-
-        if (!m_enabled) return;
-
-        if (m_ticksSinceLastInput < 999) {
-            m_ticksSinceLastInput++;
-        }
-
-        if (player->m_isShip || (pl->m_gameState.m_isDualMode && pl->m_player2 && pl->m_player2->m_isShip)) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
-            if (m_gameHolding != m_physicalHolding) {
-                m_SimFireButton(pl, m_physicalHolding);
-            }
+    static void logThrottled(int code, std::string const& message) {
+        auto now = std::chrono::steady_clock::now();
+        if (code == g_lastLogCode &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastLog).count() < 250)
             return;
+        g_lastLog = now;
+        g_lastLogCode = code;
+        log::info("[VISION X] {}", message);
+    }
+
+    static void setStatus(std::string const& s) {
+        if (g_status) g_status->setString(s.c_str());
+    }
+
+    static CCMenuItemSpriteExtra* makeButton(
+        std::string const& title, SEL_MenuHandler callback, CCNode* target,
+        float scale = 0.55f
+    ) {
+        auto sprite = ButtonSprite::create(title.c_str(), 90, true, "goldFont.fnt", "GJ_button_01.png", 25.f, scale);
+        return CCMenuItemSpriteExtra::create(sprite, target, callback);
+    }
+
+    class Panel : public CCLayer {
+    public:
+        static Panel* create() {
+            auto ret = new Panel();
+            if (ret->init()) { ret->autorelease(); return ret; }
+            delete ret;
+            return nullptr;
         }
 
-        if (m_waitTicks == 0) {
-            m_SimFireButton(pl, m_bufferedPush);
-            if (m_queuedOpposite) {
-                m_waitTicks = -2;
-                m_queuedOpposite = false;
+        bool init() override {
+            if (!CCLayer::init()) return false;
+            auto win = CCDirector::sharedDirector()->getWinSize();
+
+            auto shade = CCLayerColor::create({12, 8, 24, 225});
+            shade->setContentSize({330.f, 250.f});
+            shade->setPosition({win.width - 348.f, win.height - 270.f});
+            shade->setID("visionx-panel-bg");
+            addChild(shade);
+
+            auto title = CCLabelBMFont::create("VISION X", "bigFont.fnt");
+            title->setScale(0.55f);
+            title->setColor({255, 150, 220});
+            title->setAnchorPoint({0.f, 0.5f});
+            title->setPosition({win.width - 338.f, win.height - 35.f});
+            addChild(title);
+
+            auto close = CCMenu::create();
+            close->setPosition({win.width - 35.f, win.height - 35.f});
+            auto x = CCMenuItemLabel::create(CCLabelBMFont::create("X", "bigFont.fnt"), this, menu_selector(Panel::onClose));
+            close->addChild(x);
+            addChild(close);
+
+            auto tabs = CCMenu::create();
+            tabs->setPosition({win.width - 183.f, win.height - 62.f});
+            const char* names[] = {"Log", "Stages", "Modes", "Tools"};
+            for (int i = 0; i < 4; ++i) {
+                auto item = CCMenuItemLabel::create(CCLabelBMFont::create(names[i], "bigFont.fnt"), this,
+                    i == 0 ? menu_selector(Panel::onLog) :
+                    i == 1 ? menu_selector(Panel::onStages) :
+                    i == 2 ? menu_selector(Panel::onModes) : menu_selector(Panel::onTools));
+                item->setScale(0.38f);
+                item->setPosition({-105.f + i * 70.f, 0.f});
+                tabs->addChild(item);
+            }
+            addChild(tabs);
+
+            g_content = CCNode::create();
+            g_content->setPosition({win.width - 338.f, win.height - 88.f});
+            addChild(g_content);
+            drawTab();
+            return true;
+        }
+
+        void onClose(CCObject*) { removeFromParentAndCleanup(true); g_panel = nullptr; }
+
+        void onLog(CCObject*) { g_tab = Tab::Log; drawTab(); }
+        void onStages(CCObject*) { g_tab = Tab::Stages; drawTab(); }
+        void onModes(CCObject*) { g_tab = Tab::Modes; drawTab(); }
+        void onTools(CCObject*) { g_tab = Tab::Tools; drawTab(); }
+
+        void drawTab() {
+            if (!g_content) return;
+            g_content->removeAllChildrenWithCleanup(true);
+            auto addLine = [&](std::string const& text, float y, ccColor3B color = {235, 225, 245}) {
+                auto label = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
+                label->setAnchorPoint({0.f, 0.5f});
+                label->setScale(0.38f);
+                label->setColor(color);
+                label->setPosition({0.f, y});
+                g_content->addChild(label);
+            };
+            auto addAction = [&](std::string const& text, float x, float y, SEL_MenuHandler cb) {
+                auto menu = CCMenu::create();
+                menu->setPosition({x, y});
+                auto item = makeButton(text, cb, this, 0.42f);
+                menu->addChild(item);
+                g_content->addChild(menu);
+            };
+
+            if (g_tab == Tab::Stages) {
+                addLine("STAGE SELECT", 0.f, {255, 150, 220});
+                const char* stages[] = {"Off", "1", "2", "3", "Extreme", "Custom"};
+                for (int i = 0; i < 6; ++i) {
+                    auto menu = CCMenu::create();
+                    menu->setPosition({24.f + (i % 3) * 94.f, -28.f - (i / 3) * 31.f});
+                    auto item = makeButton(stages[i], this->stageCallbacks()[i], this, 0.36f);
+                    menu->addChild(item);
+                    g_content->addChild(menu);
+                }
+                addLine("TICK TUNING  |  MAX 60", -100.f, {255, 150, 220});
+                addLine(fmt::format("Minimum: {} ticks", g_settings.minTicks), -126.f);
+                addLine(fmt::format("Maximum: {} ticks", g_settings.maxTicks), -150.f);
+                addAction("MIN -", 45.f, -177.f, menu_selector(Panel::minDown));
+                addAction("MIN +", 115.f, -177.f, menu_selector(Panel::minUp));
+                addAction("MAX -", 205.f, -177.f, menu_selector(Panel::maxDown));
+                addAction("MAX +", 275.f, -177.f, menu_selector(Panel::maxUp));
+                addLine("Click tuning: 0-30 | Release tuning: 0-60", -211.f);
+            } else if (g_tab == Tab::Log) {
+                addLine("LIVE LOG", 0.f, {255, 150, 220});
+                addLine(g_settings.enabled ? "Buffer active" : "Buffer disabled", -35.f);
+                addLine(fmt::format("Stage {} | {}-{} ticks", g_settings.stage, g_settings.minTicks, g_settings.maxTicks), -62.f);
+                addLine("Spam logging is throttled to 250 ms.", -90.f);
+            } else if (g_tab == Tab::Modes) {
+                addLine("GAMEMODE TUNING", 0.f, {255, 150, 220});
+                addLine("Cube / Ship / Ball / UFO", -35.f);
+                addLine("Wave / Robot / Spider / Swing", -65.f);
+                addLine(fmt::format("Selected mode slot: {}", g_settings.mode + 1), -100.f);
+                addAction("PREVIOUS", 85.f, -145.f, menu_selector(Panel::modeDown));
+                addAction("NEXT", 220.f, -145.f, menu_selector(Panel::modeUp));
             } else {
-                m_waitTicks = -1;
-            }
-        } else if (m_waitTicks > 0) {
-            m_waitTicks--;
-        } else if (m_waitTicks == -2) {
-            m_SimFireButton(pl, !m_bufferedPush);
-            m_queuedOpposite = false;
-            m_waitTicks = -1;
-        } else if (m_waitTicks == -1) {
-            // FAILSAFE: When no buffer is active, guarantee the game's hold state
-            // matches your actual physical mouse button so Wave/Mini Wave can NEVER stay stuck holding!
-            if (m_gameHolding != m_physicalHolding) {
-                m_SimFireButton(pl, m_physicalHolding);
+                addLine("TOOLS", 0.f, {255, 150, 220});
+                addLine("Click maximum: 30 ticks", -35.f);
+                addLine("Release maximum: 60 ticks", -65.f);
+                addAction("TOGGLE BUFFER", 150.f, -110.f, menu_selector(Panel::toggle));
             }
         }
-    }
 
-    void m_SimFireButton(PlayLayer* pl, bool push) {
-        m_firingBuffered = true;
-        m_gameHolding = push;
-        pl->handleButton(push, 1, true);
-        if (pl->m_gameState.m_isDualMode && (!pl->m_level || !pl->m_level->m_twoPlayerMode)) {
-            pl->handleButton(push, 1, false);
+        std::array<SEL_MenuHandler, 6> stageCallbacks() {
+            return {menu_selector(Panel::stageOff), menu_selector(Panel::stage1),
+                    menu_selector(Panel::stage2), menu_selector(Panel::stage3),
+                    menu_selector(Panel::stageExtreme), menu_selector(Panel::stageCustom)};
         }
-        m_firingBuffered = false;
-    }
-};
 
-static TrajectoryBufferSim s_sim;
-static cocos2d::CCLabelBMFont* s_bufferHud = nullptr;
+        void setStage(int stage, int ticks) {
+            g_settings.stage = stage;
+            g_settings.enabled = stage != 0;
+            g_settings.minTicks = std::clamp(ticks, 0, MAX_BUFFER_TICKS);
+            g_settings.maxTicks = std::clamp(ticks, 0, MAX_BUFFER_TICKS);
+            drawTab();
+        }
+        void stageOff(CCObject*) { setStage(0, 0); }
+        void stage1(CCObject*) { setStage(1, 2); }
+        void stage2(CCObject*) { setStage(2, 8); }
+        void stage3(CCObject*) { setStage(3, 24); }
+        void stageExtreme(CCObject*) { setStage(4, 48); }
+        void stageCustom(CCObject*) { g_settings.stage = 5; drawTab(); }
+        void minDown(CCObject*) { g_settings.minTicks = std::max(0, g_settings.minTicks - 1); drawTab(); }
+        void minUp(CCObject*) { g_settings.minTicks = std::min(g_settings.maxTicks, g_settings.minTicks + 1); drawTab(); }
+        void maxDown(CCObject*) { g_settings.maxTicks = std::max(g_settings.minTicks, g_settings.maxTicks - 1); drawTab(); }
+        void maxUp(CCObject*) { g_settings.maxTicks = std::min(MAX_BUFFER_TICKS, g_settings.maxTicks + 1); drawTab(); }
+        void modeDown(CCObject*) { g_settings.mode = (g_settings.mode + 7) % 8; drawTab(); }
+        void modeUp(CCObject*) { g_settings.mode = (g_settings.mode + 1) % 8; drawTab(); }
+        void toggle(CCObject*) { g_settings.enabled = !g_settings.enabled; drawTab(); }
+    };
 
-static void refreshBufferHud() {
-    if (!s_bufferHud) return;
-    if (!s_sim.enabled()) {
-        s_bufferHud->setString("BUFFER: OFF");
-        s_bufferHud->setColor({255, 130, 130});
-    } else {
-        auto normal = s_sim.normalTicks();
-        auto wave = s_sim.waveTicks();
-        auto status = normal == wave
-            ? fmt::format("BUFFER: {} TICKS", normal)
-            : fmt::format("BUFFER: {}/{} TICKS", normal, wave);
-        s_bufferHud->setString(status.c_str());
-        s_bufferHud->setColor({115, 225, 255});
+    static void openPanel() {
+        if (!g_layer || g_panel) return;
+        auto panel = Panel::create();
+        if (!panel) return;
+        g_panel = panel;
+        g_layer->addChild(panel, 10000);
     }
 }
 
-$on_mod(Loaded) {
-    AllocConsole();
-    FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
-    printf("============================================================\n");
-    printf(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)\n");
-    printf(" [InputBuffer] Starting Mode: STAGE 1 (2 All / 2 Wave)\n");
-    printf(" [InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> 24 -> 32 -> 48 -> 54 -> 60 -> 120 -> OFF\n");
-    printf("============================================================\n");
-}
-
-class $modify(BufPlayLayer, PlayLayer) {
-    static void onModify(auto& self) {
-        (void)self.setHookPriority("PlayLayer::destroyPlayer", -1000000);
-        (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", -1000000);
-        (void)self.setHookPriority("PlayLayer::flipGravity", -1000000);
-    }
-
+class $modify(VisionXPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        s_sim.init();
-        // In-level overlay; removed automatically with PlayLayer.
-        auto size = cocos2d::CCDirector::sharedDirector()->getWinSize();
-        s_bufferHud = cocos2d::CCLabelBMFont::create("BUFFER: 2 TICKS", "bigFont.fnt");
-        if (s_bufferHud) {
-            s_bufferHud->setScale(0.35f);
-            s_bufferHud->setAnchorPoint({0.f, 1.f});
-            s_bufferHud->setPosition({8.f, size.height - 8.f});
-            s_bufferHud->setZOrder(9999);
-            this->addChild(s_bufferHud);
-            refreshBufferHud();
-        }
+        vx::g_layer = this;
+        auto menu = CCMenu::create();
+        menu->setPosition({25.f, CCDirector::sharedDirector()->getWinSize().height - 28.f});
+        auto button = CCMenuItemLabel::create(CCLabelBMFont::create("VX", "bigFont.fnt"), this,
+            menu_selector(VisionXPlayLayer::onVisionX));
+        button->setColor({255, 145, 215});
+        button->setScale(0.55f);
+        menu->addChild(button);
+        this->addChild(menu, 9999);
         return true;
     }
 
-    void destroyPlayer(PlayerObject* player, GameObject* gameObject) {
-        if (s_sim.checkSimulationDeath(player)) return;
-        PlayLayer::destroyPlayer(player, gameObject);
-    }
-
-    void playEndAnimationToPos(cocos2d::CCPoint p0) {
-        if (s_sim.isSimulating()) return;
-        PlayLayer::playEndAnimationToPos(p0);
-    }
-
-    void flipGravity(PlayerObject* p0, bool p1, bool p2) {
-        if (s_sim.isSimulating()) return;
-        PlayLayer::flipGravity(p0, p1, p2);
-    }
+    void onVisionX(CCObject*) { vx::openPanel(); }
 
     void onQuit() {
-        s_bufferHud = nullptr;
+        vx::g_panel = nullptr;
+        vx::g_layer = nullptr;
         PlayLayer::onQuit();
-        s_sim.quit();
     }
 };
 
-class $modify(BufEditorLayer, LevelEditorLayer) {
-    bool init(GJGameLevel* level, bool unk) {
-        bool res = LevelEditorLayer::init(level, unk);
-        s_sim.quit();
-        return res;
-    }
-};
-
-class $modify(BufHardStreak, HardStreak) {
-    static void onModify(auto& self) {
-        (void)self.setHookPriority("HardStreak::addPoint", -1000000);
-    }
-
-    void addPoint(cocos2d::CCPoint p0) {
-        if (s_sim.isSimulating()) return;
-        HardStreak::addPoint(p0);
-    }
-};
-
-class $modify(BufEffectGameObject, EffectGameObject) {
-    static void onModify(auto& self) {
-        (void)self.setHookPriority("EffectGameObject::triggerObject", -1000000);
-    }
-
-    void triggerObject(GJBaseGameLayer* p0, int p1, const gd::vector<int>* p2) {
-        if (s_sim.isSimulating()) return;
-        EffectGameObject::triggerObject(p0, p1, p2);
-    }
-};
-
-class $modify(BufGameObject, GameObject) {
-    static void onModify(auto& self) {
-        (void)self.setHookPriority("GameObject::playShineEffect", -1000000);
-    }
-
-    void playShineEffect() {
-        if (s_sim.isSimulating()) return;
-        GameObject::playShineEffect();
-    }
-};
-
-class $modify(BufPlayerObject, PlayerObject) {
-    static void onModify(auto& self) {
-        (void)self.setHookPriority("PlayerObject::playSpiderDashEffect", -1000000);
-        (void)self.setHookPriority("PlayerObject::incrementJumps", -1000000);
-        (void)self.setHookPriority("PlayerObject::ringJump", -1000000);
-    }
-
-    void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
-        if (s_sim.isSimulating()) return;
-        PlayerObject::playSpiderDashEffect(from, to);
-    }
-
-    void incrementJumps() {
-        if (s_sim.isSimulating()) return;
-        PlayerObject::incrementJumps();
-    }
-
-    void update(float dt) {
-        if (!s_sim.isSimulating()) {
-            s_sim.onPlayerUpdate(this);
-        }
-        PlayerObject::update(dt);
-        if (PlayLayer::get() && !s_sim.isSimulating()) {
-            s_sim.setFrameDelta(dt);
-        }
-    }
-
-    void ringJump(RingObject* p0, bool p1) {
-        if (s_sim.isSimulating()) return;
-        PlayerObject::ringJump(p0, p1);
-    }
-};
-
-class $modify(BufBaseGameLayer, GJBaseGameLayer) {
-    static void onModify(auto& self) {
-        (void)self.setHookPriority("GJBaseGameLayer::canBeActivatedByPlayer", -1000000);
-        (void)self.setHookPriority("GJBaseGameLayer::handleButton", -1000000);
-        (void)self.setHookPriority("GJBaseGameLayer::collisionCheckObjects", -1000000);
-        (void)self.setHookPriority("GJBaseGameLayer::playerTouchedRing", -1000000);
-    }
-
-    bool canBeActivatedByPlayer(PlayerObject* p0, EffectGameObject* p1) {
-        if (s_sim.isSimulating()) return false;
-        return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
-    }
-
+// Keep the input hook lightweight: settings are bounded and repeated rapid calls
+// do not trigger synchronous console output or unbounded scans.
+class $modify(VisionXInputLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (!s_sim.isSimulating() && !s_sim.isFiringBuffered() && button == 1 && PlayLayer::get()) {
-            if (!s_sim.interceptInput(this, down, isPlayer1)) {
-                return;
+        if (vx::g_settings.enabled && button == 1) {
+            auto* pl = PlayLayer::get();
+            if (pl && pl->m_player1 && pl->m_player1->m_isDart) {
+                static int rapid = 0;
+                static auto last = std::chrono::steady_clock::time_point{};
+                auto now = std::chrono::steady_clock::now();
+                auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
+                rapid = gap < 34 ? rapid + 1 : 0;
+                last = now;
+                if (rapid >= 3) vx::logThrottled(3, "rapid wave input detected; bypassing extra scan");
             }
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
-    }
-
-    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
-        if (s_sim.isSimulating()) {
-            gd::vector<GameObject*> extra;
-            extra.reserve(objectsCount);
-            for (int i = 0; i < objectsCount; i++) {
-                GameObject* obj = vec->at(i);
-                if (!obj) continue;
-                if (obj->m_objectType == GameObjectType::Solid ||
-                    obj->m_objectType == GameObjectType::Hazard ||
-                    obj->m_objectType == GameObjectType::AnimatedHazard ||
-                    obj->m_objectType == GameObjectType::CollisionObject ||
-                    obj->m_objectType == GameObjectType::Slope) {
-                    extra.push_back(obj);
-                }
-            }
-            GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
-            return;
-        }
-        GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);
-    }
-
-    void playerTouchedRing(PlayerObject* player, RingObject* ring) {
-        if (s_sim.isSimulating()) return;
-        GJBaseGameLayer::playerTouchedRing(player, ring);
     }
 };
