@@ -97,8 +97,8 @@ namespace vx {
         static constexpr float PANEL_H = 440.f;
 
         CCLayerColor* m_shade = nullptr;
-        CCNode* m_panel = nullptr;
-        CCNode* m_content = nullptr;
+        CCLayerColor* m_panel = nullptr;
+        CCLayerColor* m_content = nullptr;
         float m_panelScale = 1.f;
         Tab m_tab = Tab::Stages;
         TuningPage m_tuningPage = TuningPage::Tick;
@@ -137,7 +137,9 @@ namespace vx {
             if (!m_shade) return false;
             addChild(m_shade, 0);
 
-            m_panel = CCNode::create();
+            // CCLayerColor exposes opacity and cascading opacity support; CCNode does not.
+            m_panel = CCLayerColor::create({0, 0, 0, 0}, PANEL_W, PANEL_H);
+            if (!m_panel) return false;
             m_panel->setContentSize({PANEL_W, PANEL_H});
             m_panel->setAnchorPoint({0.5f, 0.5f});
             m_panel->setPosition({win.width / 2.f, win.height / 2.f});
@@ -148,7 +150,10 @@ namespace vx {
             addChild(m_panel, 10);
 
             buildPanelChrome();
-            m_content = CCNode::create();
+            // Keep the content in an opacity-capable layer so its fade animates all controls.
+            m_content = CCLayerColor::create({0, 0, 0, 0}, PANEL_W, PANEL_H);
+            if (!m_content) return false;
+            m_content->setCascadeOpacityEnabled(true);
             m_content->setContentSize({PANEL_W, PANEL_H});
             m_content->setAnchorPoint({0.5f, 0.5f});
             m_content->setPosition({PANEL_W / 2.f, PANEL_H / 2.f});
