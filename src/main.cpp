@@ -528,18 +528,7 @@ namespace vx {
             highlight->setPosition({center.x - size.width * 0.5f + 11.f,
                                      center.y + size.height * 0.5f - 7.f});
             m_content->addChild(highlight, 3);
-        }) {
-            auto rim = roundedRect({size.width + 3.f, size.height + 3.f},
-                {108, 77, 133}, 210);
-            rim->setPosition(center);
-            m_content->addChild(rim, 0);
-
-            auto card = roundedRect({size.width - 2.f, size.height - 2.f},
-                color, 246);
-            card->setPosition(center);
-            m_content->addChild(card, 1);
-        }
-
+                }
         void addButton(const std::string& title, CCPoint center, CCSize size,
                        std::function<void()> callback, bool selected = false,
                        bool quiet = false, float labelScale = 0.30f) {
