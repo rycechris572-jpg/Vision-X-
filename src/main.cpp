@@ -400,7 +400,10 @@ namespace vx {
                 for (int j = 0; j < 10; ++j) {
                     const float angle = -1.57079632679f + static_cast<float>(j) * 0.62831853071f;
                     const float radius = (j % 2 == 0) ? st.r : st.r * 0.34f;
-                    p[j] = {st.r + std::cos(angle) * radius, st.r + std::sin(angle) * radius};
+                  p[j] = CCPoint(
+    st.r + std::cos(angle) * radius,
+    st.r + std::sin(angle) * radius
+);
                 }
                 const float alpha = static_cast<float>(st.alpha) / 255.f;
                 draw->drawPolygon(p, 10, ccColor4F{0.42f,0.16f,0.75f,alpha*0.72f},
